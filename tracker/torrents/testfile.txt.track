@@ -1,0 +1,6 @@
+Filename: testfile.txt
+Filesize: 50
+Description: test_file
+MD5: 8b88d953dfd3148d1f87ae1747248515
+#list of peers follows next
+127.0.0.1:4001:0:50:1774237068
