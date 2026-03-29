@@ -229,15 +229,25 @@ def cmd_download(client_cfg, server_cfg, filename):
             sock.settimeout(15)
             sock.connect((peer["ip"], peer["port"]))
 
-            request = f"GET {filename} 0 {filesize}\n"
-            sock.sendall(request.encode())
-
             received = b""
-            while len(received) < filesize:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
+            CHUNK_SIZE = 1024
+            offset = peer["start"]
+            end = peer["end"]
+
+            while offset < end:
+                chunk_end = min(offset + CHUNK_SIZE, end)
+                request = f"GET {filename} {offset} {chunk_end}\n"
+                sock.sendall(request.encode())
+
+                chunk = b""
+                while len(chunk) < chunk_end - offset:
+                    part = sock.recv(chunk_end - offset - len(chunk))
+                    if not part:
+                        break
+                    chunk += part
+
                 received += chunk
+                offset = chunk_end
                 pct = len(received) * 100 // filesize if filesize > 0 else 100
                 print(f"\r  Downloading: {pct}% ({len(received)}/{filesize} bytes)", end="")
 
@@ -288,11 +298,11 @@ def handle_peer_request(conn, addr, shared_folder):
         start = int(parts[2])
         end = int(parts[3])
 
-        # TODO: enforce 1024 byte chunk limit for final
-        # if end - start > 1024:
-        #     conn.sendall(b"<GET invalid>\n")
-        #     conn.close()
-        #     return
+        # enforce 1024 byte chunk limit per the protocol spec
+        if end - start > 1024:
+            conn.sendall(b"<GET invalid>\n")
+            conn.close()
+            return
 
         filepath = os.path.join(shared_folder, filename)
         if not os.path.exists(filepath):
