@@ -225,10 +225,6 @@ def cmd_download(client_cfg, server_cfg, filename):
 
         print(f"  Connecting to peer {peer['ip']}:{peer['port']}...")
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(15)
-            sock.connect((peer["ip"], peer["port"]))
-
             received = b""
             CHUNK_SIZE = 1024
             offset = peer["start"]
@@ -236,6 +232,12 @@ def cmd_download(client_cfg, server_cfg, filename):
 
             while offset < end:
                 chunk_end = min(offset + CHUNK_SIZE, end)
+
+                # open a fresh connection per chunk since server closes after each request
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(15)
+                sock.connect((peer["ip"], peer["port"]))
+
                 request = f"GET {filename} {offset} {chunk_end}\n"
                 sock.sendall(request.encode())
 
@@ -246,13 +248,11 @@ def cmd_download(client_cfg, server_cfg, filename):
                         break
                     chunk += part
 
+                sock.close()
                 received += chunk
                 offset = chunk_end
                 pct = len(received) * 100 // filesize if filesize > 0 else 100
                 print(f"\r  Downloading: {pct}% ({len(received)}/{filesize} bytes)", end="")
-
-            print()
-            sock.close()
 
             with open(output_path, "wb") as f:
                 f.write(received)
