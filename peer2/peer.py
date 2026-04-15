@@ -166,9 +166,38 @@ def cmd_get_tracker(client_cfg, trackname):
     return None
 
 
+def download_chunk(peer, filename, chunk_start, chunk_end, results, results_lock):
+    # downloads a single 1024-byte chunk from a peer and stores it in results
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(15)
+        sock.connect((peer["ip"], peer["port"]))
+
+        request = f"GET {filename} {chunk_start} {chunk_end}\n"
+        sock.sendall(request.encode())
+
+        chunk = b""
+        expected = chunk_end - chunk_start
+        while len(chunk) < expected:
+            part = sock.recv(expected - len(chunk))
+            if not part:
+                break
+            chunk += part
+
+        sock.close()
+
+        if chunk:
+            with results_lock:
+                results[chunk_start] = chunk
+            print(f"  [DOWNLOAD] Got bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}")
+        else:
+            print(f"  [DOWNLOAD] Empty response for bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}")
+
+    except Exception as e:
+        print(f"  [DOWNLOAD] Failed bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}: {e}")
+
+
 def cmd_download(client_cfg, server_cfg, filename):
-    # grabs the tracker file, picks the best peer, downloads the whole file
-    # TODO: multi-threaded chunked download from multiple peers for final
     trackname = f"{filename}.track"
     cache_path = os.path.join("cache", trackname)
 
@@ -202,7 +231,14 @@ def cmd_download(client_cfg, server_cfg, filename):
         print("  No peers available for this file.")
         return
 
-    # newest timestamp = freshest peer, try that one first
+    # remove ourselves from the peer list
+    peers = [p for p in peers if p["port"] != server_cfg["listen_port"]]
+
+    if not peers:
+        print("  No external peers available for this file.")
+        return
+
+    # sort by newest timestamp — freshest peers first
     peers.sort(key=lambda p: p["timestamp"], reverse=True)
 
     filesize = 0
@@ -218,50 +254,65 @@ def cmd_download(client_cfg, server_cfg, filename):
     os.makedirs(shared, exist_ok=True)
     output_path = os.path.join(shared, filename)
 
-    for peer in peers:
-        # dont try to download from ourselves lol
-        if peer["port"] == server_cfg["listen_port"]:
-            continue
+    CHUNK_SIZE = 1024
 
-        print(f"  Connecting to peer {peer['ip']}:{peer['port']}...")
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(15)
-            sock.connect((peer["ip"], peer["port"]))
+    # build the full list of chunks that need to be downloaded
+    chunks = []
+    offset = 0
+    while offset < filesize:
+        chunk_end = min(offset + CHUNK_SIZE, filesize)
+        chunks.append((offset, chunk_end))
+        offset = chunk_end
 
-            request = f"GET {filename} 0 {filesize}\n"
-            sock.sendall(request.encode())
+    print(f"  Total chunks: {len(chunks)}, distributing across {len(peers)} peer(s)")
 
-            received = b""
-            while len(received) < filesize:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                received += chunk
-                pct = len(received) * 100 // filesize if filesize > 0 else 100
-                print(f"\r  Downloading: {pct}% ({len(received)}/{filesize} bytes)", end="")
+    # assign chunks round-robin across peers by newest timestamp
+    results = {}
+    results_lock = threading.Lock()
+    threads = []
 
-            print()
-            sock.close()
+    for i, (chunk_start, chunk_end) in enumerate(chunks):
+        peer = peers[i % len(peers)]
+        t = threading.Thread(
+            target=download_chunk,
+            args=(peer, filename, chunk_start, chunk_end, results, results_lock)
+        )
+        threads.append(t)
+        t.start()
 
-            with open(output_path, "wb") as f:
-                f.write(received)
+    # wait for all threads to finish
+    for t in threads:
+        t.join()
 
-            print(f"  File downloaded: {output_path} ({len(received)} bytes)")
+    # check how many chunks we actually got
+    received_bytes = sum(len(v) for v in results.values())
+    print(f"\n  Downloaded {received_bytes}/{filesize} bytes across {len(results)}/{len(chunks)} chunks")
 
-            if len(received) >= filesize:
-                if os.path.exists(cache_path):
-                    os.remove(cache_path)
-                    print(f"  Cache cleaned: {cache_path}")
-                # let the tracker know we have the full file now
-                cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
-            return
+    if not results:
+        print("  Error: Could not download any chunks.")
+        return
 
-        except Exception as e:
-            print(f"  Failed to download from {peer['ip']}:{peer['port']}: {e}")
-            continue
+    # merge chunks in order by start offset
+    with open(output_path, "wb") as f:
+        for chunk_start, chunk_end in chunks:
+            if chunk_start in results:
+                f.write(results[chunk_start])
+            else:
+                # write zeros for any missing chunks so the file is not corrupt
+                f.write(b"\x00" * (chunk_end - chunk_start))
+                print(f"  Warning: missing chunk {chunk_start}-{chunk_end}, filled with zeros")
 
-    print("  Error: Could not download from any peer.")
+    print(f"  File saved: {output_path}")
+
+    if received_bytes >= filesize:
+        print(f"  File download complete: {filename}")
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+            print(f"  Cache cleaned: {cache_path}")
+        # let the tracker know we now have the full file
+        cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
+    else:
+        print(f"  Warning: download incomplete ({received_bytes}/{filesize} bytes). Will retry on next update cycle.")
 
 
 # --- peer server thread ---
@@ -288,11 +339,11 @@ def handle_peer_request(conn, addr, shared_folder):
         start = int(parts[2])
         end = int(parts[3])
 
-        # TODO: enforce 1024 byte chunk limit for final
-        # if end - start > 1024:
-        #     conn.sendall(b"<GET invalid>\n")
-        #     conn.close()
-        #     return
+        # enforce 1024 byte chunk limit per the protocol spec
+        if end - start > 1024:
+            conn.sendall(b"<GET invalid>\n")
+            conn.close()
+            return
 
         filepath = os.path.join(shared_folder, filename)
         if not os.path.exists(filepath):
