@@ -226,8 +226,8 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
         if peer["port"] == server_cfg["listen_port"]:
             continue
 
-        # skip peers that only hold bytes we already have on disk (for resume usecase)
-        if peer["end"] <= resume_from:
+        # skip peers if they do not have a byte window including resume_from 
+        if not peer["start"] <= resume_from < peer["end"]:
             continue
 
         download_start = max(peer["start"], resume_from)
@@ -260,13 +260,21 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
                 sock.close()
                 received += chunk
                 offset = chunk_end
-                pct = len(received) * 100 // filesize if filesize > 0 else 100
+                pct = (len(received)+resume_from) * 100 // filesize if filesize > 0 else 100
                 print(f"\r  Downloading: {pct}% ({len(received)+resume_from}/{filesize} bytes)", end="")
 
-            #Append if resuming, overwrite if fresh start download
-            file_mode = "ab" if resume_from > 0 else "wb"
-            with open(output_path, file_mode) as f:
-                f.write(received)
+            #Should always start from resume_from but just covering case where it's early
+            overlap = resume_from - download_start
+            if overlap > 0:
+                received = received[overlap:]
+            write_offset = download_start + max(0, overlap)
+            if resume_from > 0 and os.path.exists(output_path):
+                with open(output_path, "r+b") as f:
+                    f.seek(write_offset)
+                    f.write(received)
+            else:
+                with open(output_path, "wb") as f:
+                    f.write(received)
 
             total_bytes = resume_from + len(received)
             print(f"  File downloaded: {output_path} ({total_bytes} bytes)")
@@ -427,11 +435,12 @@ def resume_incomplete_downloads(client_cfg, server_cfg):
             #Covering cases: file complete tracker not cleaned up
             if partial_size >= filesize: 
                 print(f"[RESUME] {filename}: already complete ({partial_size}/{filesize} bytes), cleaning cache.")
+                cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
                 os.remove(cache_path)
-            #Partial download to be resumed
+            #Partial download to be resumed, fetch fresh tracker and attempt download
             else:
                 print(f"[RESUME] {filename}: partial file found ({partial_size}/{filesize} bytes), resuming...")
-                os.remove(cache_path)
+                cmd_get_tracker(client_cfg, filename)
                 cmd_download(client_cfg, server_cfg, filename, resume_from=partial_size)
         #Tracker file but no partial, download from beginning
         else:
