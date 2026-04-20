@@ -166,7 +166,7 @@ def cmd_get_tracker(client_cfg, trackname):
     return None
 
 
-def cmd_download(client_cfg, server_cfg, filename):
+def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
     # grabs the tracker file, picks the best peer, downloads the whole file
     # TODO: multi-threaded chunked download from multiple peers for final
     trackname = f"{filename}.track"
@@ -211,7 +211,10 @@ def cmd_download(client_cfg, server_cfg, filename):
             filesize = int(line.split(":")[1].strip())
             break
 
-    print(f"  File: {filename}, Size: {filesize} bytes")
+    if resume_from > 0:
+        print(f"  File: {filename}, Size: {filesize} bytes (resuming from byte {resume_from})")
+    else:
+        print(f"  File: {filename}, Size: {filesize} bytes")
     print(f"  Available peers: {len(peers)}")
 
     shared = server_cfg["shared_folder"]
@@ -223,11 +226,17 @@ def cmd_download(client_cfg, server_cfg, filename):
         if peer["port"] == server_cfg["listen_port"]:
             continue
 
+        # skip peers if they do not have a byte window including resume_from 
+        if not peer["start"] <= resume_from < peer["end"]:
+            continue
+
+        download_start = max(peer["start"], resume_from)
+
         print(f"  Connecting to peer {peer['ip']}:{peer['port']}...")
         try:
             received = b""
             CHUNK_SIZE = 1024
-            offset = peer["start"]
+            offset = download_start
             end = peer["end"]
 
             while offset < end:
@@ -251,26 +260,40 @@ def cmd_download(client_cfg, server_cfg, filename):
                 sock.close()
                 received += chunk
                 offset = chunk_end
-                pct = len(received) * 100 // filesize if filesize > 0 else 100
-                print(f"\r  Downloading: {pct}% ({len(received)}/{filesize} bytes)", end="")
+                pct = (len(received)+resume_from) * 100 // filesize if filesize > 0 else 100
+                print(f"\r  Downloading: {pct}% ({len(received)+resume_from}/{filesize} bytes)", end="")
 
-            with open(output_path, "wb") as f:
-                f.write(received)
+            #Should always start from resume_from but just covering case where it's early
+            overlap = resume_from - download_start
+            if overlap > 0:
+                received = received[overlap:]
+            write_offset = download_start + max(0, overlap)
+            if resume_from > 0 and os.path.exists(output_path):
+                with open(output_path, "r+b") as f:
+                    f.seek(write_offset)
+                    f.write(received)
+            else:
+                with open(output_path, "wb") as f:
+                    f.write(received)
 
-            print(f"  File downloaded: {output_path} ({len(received)} bytes)")
+            total_bytes = resume_from + len(received)
+            print(f"  File downloaded: {output_path} ({total_bytes} bytes)")
 
-            if len(received) >= filesize:
+            if total_bytes >= filesize:
                 if os.path.exists(cache_path):
                     os.remove(cache_path)
                     print(f"  Cache cleaned: {cache_path}")
                 # let the tracker know we have the full file now
                 cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
+            else:
+                cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(total_bytes))
+                print(f"  Warning: only received {total_bytes}/{filesize} bytes.")
             return
 
         except Exception as e:
             print(f"  Failed to download from {peer['ip']}:{peer['port']}: {e}")
             continue
-
+        
     print("  Error: Could not download from any peer.")
 
 
@@ -366,6 +389,68 @@ def periodic_update(client_cfg, server_cfg):
                     pass
 
 
+# --- resume incomplete downloads ---
+# checks cache and shared for matching tracker and partial files respectively
+# continues download from where left off
+
+def resume_incomplete_downloads(client_cfg, server_cfg):
+    shared =server_cfg["shared_folder"]
+    cache_dir = "cache"
+
+    if not os.path.exists(cache_dir):
+        return
+    
+    track_files = [f for f in os.listdir(cache_dir) if f.endswith("track")]
+    if not track_files:
+        return
+    
+    print(f"\n[RESUME] Found {len(track_files)} cached tracker file(s). Checking for incomplete downloads...")
+
+    for trackname in track_files:
+        filename = trackname[:-6]
+        partial_path = os.path.join(shared, filename)
+        cache_path = os.path.join(cache_dir, trackname)
+
+        try:
+            with open(cache_path, "r") as f:
+                content = f.read()
+        except Exception as e:
+            print(f"[RESUME] Could not read {cache_path}: {e}, skipping.")
+            continue
+        filesize = 0
+        for line in content.strip().split("\n"):
+            if line.startswith("Filesize:"):
+                try:
+                    filesize = int(line.split(':')[1].strip())
+                except ValueError:
+                    pass
+                break
+        
+        if filesize == 0:
+            print(f"[RESUME] Could not determine filesize for {filename}, skipping.")
+            continue
+
+        if os.path.exists(partial_path):
+            partial_size = os.path.getsize(partial_path)
+            #Covering cases: file complete tracker not cleaned up
+            if partial_size >= filesize: 
+                print(f"[RESUME] {filename}: already complete ({partial_size}/{filesize} bytes), cleaning cache.")
+                cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
+                os.remove(cache_path)
+            #Partial download to be resumed, fetch fresh tracker and attempt download
+            else:
+                print(f"[RESUME] {filename}: partial file found ({partial_size}/{filesize} bytes), resuming...")
+                cmd_get_tracker(client_cfg, f"{filename}.track")
+                cmd_download(client_cfg, server_cfg, filename, resume_from=partial_size)
+        #Tracker file but no partial, download from beginning
+        else:
+            print(f"[RESUME] {filename}: no partial file found, starting fresh download...")
+            cmd_get_tracker(client_cfg, f"{filename}.track")
+            cmd_download(client_cfg, server_cfg, filename, resume_from=0)
+
+    print()
+
+
 # --- interactive cli ---
 
 def interactive_cli(client_cfg, server_cfg):
@@ -453,6 +538,8 @@ def main():
     server_thread.daemon = True
     server_thread.start()
 
+    resume_incomplete_downloads(client_cfg, server_cfg)
+    
     # background thread for periodic tracker updates
     update_thread = threading.Thread(
         target=periodic_update,
@@ -460,6 +547,8 @@ def main():
     )
     update_thread.daemon = True
     update_thread.start()
+    
+    
 
     interactive_cli(client_cfg, server_cfg)
 
