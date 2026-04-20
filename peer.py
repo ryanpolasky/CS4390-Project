@@ -440,12 +440,12 @@ def resume_incomplete_downloads(client_cfg, server_cfg):
             #Partial download to be resumed, fetch fresh tracker and attempt download
             else:
                 print(f"[RESUME] {filename}: partial file found ({partial_size}/{filesize} bytes), resuming...")
-                cmd_get_tracker(client_cfg, filename)
+                cmd_get_tracker(client_cfg, f"{filename}.track")
                 cmd_download(client_cfg, server_cfg, filename, resume_from=partial_size)
         #Tracker file but no partial, download from beginning
         else:
             print(f"[RESUME] {filename}: no partial file found, starting fresh download...")
-            os.remove(cache_path)
+            cmd_get_tracker(client_cfg, f"{filename}.track")
             cmd_download(client_cfg, server_cfg, filename, resume_from=0)
 
     print()
@@ -538,6 +538,8 @@ def main():
     server_thread.daemon = True
     server_thread.start()
 
+    resume_incomplete_downloads(client_cfg, server_cfg)
+    
     # background thread for periodic tracker updates
     update_thread = threading.Thread(
         target=periodic_update,
@@ -546,7 +548,7 @@ def main():
     update_thread.daemon = True
     update_thread.start()
     
-    resume_incomplete_downloads(client_cfg, server_cfg)
+    
 
     interactive_cli(client_cfg, server_cfg)
 
