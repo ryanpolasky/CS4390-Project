@@ -1,6 +1,7 @@
 Filename: largefile.bin
 Filesize: 102400
-Description: large_binary_file
-MD5: c40eb3b1d872ac5b5853506c72128f6e
+Description: largefile
+MD5: fefc2a1f5440b46bdf5485d614117dd3
 #list of peers follows next
-127.0.0.1:4002:0:102400:1774237068
+127.0.0.1:4002:0:102400:1776819502
+100.69.33.161:4003:0:102400:1776819503
