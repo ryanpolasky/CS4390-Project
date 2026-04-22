@@ -232,7 +232,13 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
         return
 
     # remove ourselves from the peer list
-    peers = [p for p in peers if p["port"] != server_cfg["listen_port"]]
+    self_ip = server_cfg.get("ip")  # or detect it
+    self_port = server_cfg["listen_port"]
+
+    peers = [
+        p for p in peers
+        if not (p["ip"] == self_ip and p["port"] == self_port)
+    ]
 
     if not peers:
         print("  No external peers available for this file.")
