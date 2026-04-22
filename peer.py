@@ -197,7 +197,7 @@ def download_chunk(peer, filename, chunk_start, chunk_end, results, results_lock
         print(f"  [DOWNLOAD] Failed bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}: {e}")
 
 
-def cmd_download(client_cfg, server_cfg, filename):
+def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
     trackname = f"{filename}.track"
     cache_path = os.path.join("cache", trackname)
 
@@ -247,7 +247,10 @@ def cmd_download(client_cfg, server_cfg, filename):
             filesize = int(line.split(":")[1].strip())
             break
 
-    print(f"  File: {filename}, Size: {filesize} bytes")
+    if resume_from > 0:
+        print(f"  File: {filename}, Size: {filesize} bytes (resuming from byte {resume_from})")
+    else:
+        print(f"  File: {filename}, Size: {filesize} bytes")
     print(f"  Available peers: {len(peers)}")
 
     shared = server_cfg["shared_folder"]
@@ -256,9 +259,9 @@ def cmd_download(client_cfg, server_cfg, filename):
 
     CHUNK_SIZE = 1024
 
-    # build the full list of chunks that need to be downloaded
+    # build chunk list starting from resume_from
     chunks = []
-    offset = 0
+    offset = resume_from
     while offset < filesize:
         chunk_end = min(offset + CHUNK_SIZE, filesize)
         chunks.append((offset, chunk_end))
@@ -286,33 +289,34 @@ def cmd_download(client_cfg, server_cfg, filename):
 
     # check how many chunks we actually got
     received_bytes = sum(len(v) for v in results.values())
-    print(f"\n  Downloaded {received_bytes}/{filesize} bytes across {len(results)}/{len(chunks)} chunks")
+    print(f"\n  Downloaded {received_bytes}/{filesize - resume_from} bytes across {len(results)}/{len(chunks)} chunks")
 
     if not results:
         print("  Error: Could not download any chunks.")
         return
 
-    # merge chunks in order by start offset
-    with open(output_path, "wb") as f:
+    # write chunks using seek so resume overwrites at the correct offset
+    mode = "r+b" if resume_from > 0 and os.path.exists(output_path) else "wb"
+    with open(output_path, mode) as f:
         for chunk_start, chunk_end in chunks:
+            f.seek(chunk_start)
             if chunk_start in results:
                 f.write(results[chunk_start])
             else:
-                # write zeros for any missing chunks so the file is not corrupt
                 f.write(b"\x00" * (chunk_end - chunk_start))
                 print(f"  Warning: missing chunk {chunk_start}-{chunk_end}, filled with zeros")
 
     print(f"  File saved: {output_path}")
 
-    if received_bytes >= filesize:
+    total_bytes = resume_from + received_bytes
+    if total_bytes >= filesize:
         print(f"  File download complete: {filename}")
         if os.path.exists(cache_path):
             os.remove(cache_path)
             print(f"  Cache cleaned: {cache_path}")
-        # let the tracker know we now have the full file
         cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
     else:
-        print(f"  Warning: download incomplete ({received_bytes}/{filesize} bytes). Will retry on next update cycle.")
+        print(f"  Warning: download incomplete ({total_bytes}/{filesize} bytes). Will retry on next update cycle.")
 
 
 # --- peer server thread ---
@@ -407,6 +411,68 @@ def periodic_update(client_cfg, server_cfg):
                     pass
 
 
+# --- resume incomplete downloads ---
+# checks cache and shared for matching tracker and partial files respectively
+# continues download from where left off
+
+def resume_incomplete_downloads(client_cfg, server_cfg):
+    shared =server_cfg["shared_folder"]
+    cache_dir = "cache"
+
+    if not os.path.exists(cache_dir):
+        return
+    
+    track_files = [f for f in os.listdir(cache_dir) if f.endswith("track")]
+    if not track_files:
+        return
+    
+    print(f"\n[RESUME] Found {len(track_files)} cached tracker file(s). Checking for incomplete downloads...")
+
+    for trackname in track_files:
+        filename = trackname[:-6]
+        partial_path = os.path.join(shared, filename)
+        cache_path = os.path.join(cache_dir, trackname)
+
+        try:
+            with open(cache_path, "r") as f:
+                content = f.read()
+        except Exception as e:
+            print(f"[RESUME] Could not read {cache_path}: {e}, skipping.")
+            continue
+        filesize = 0
+        for line in content.strip().split("\n"):
+            if line.startswith("Filesize:"):
+                try:
+                    filesize = int(line.split(':')[1].strip())
+                except ValueError:
+                    pass
+                break
+        
+        if filesize == 0:
+            print(f"[RESUME] Could not determine filesize for {filename}, skipping.")
+            continue
+
+        if os.path.exists(partial_path):
+            partial_size = os.path.getsize(partial_path)
+            #Covering cases: file complete tracker not cleaned up
+            if partial_size >= filesize: 
+                print(f"[RESUME] {filename}: already complete ({partial_size}/{filesize} bytes), cleaning cache.")
+                cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
+                os.remove(cache_path)
+            #Partial download to be resumed, fetch fresh tracker and attempt download
+            else:
+                print(f"[RESUME] {filename}: partial file found ({partial_size}/{filesize} bytes), resuming...")
+                cmd_get_tracker(client_cfg, f"{filename}.track")
+                cmd_download(client_cfg, server_cfg, filename, resume_from=partial_size)
+        #Tracker file but no partial, download from beginning
+        else:
+            print(f"[RESUME] {filename}: no partial file found, starting fresh download...")
+            cmd_get_tracker(client_cfg, f"{filename}.track")
+            cmd_download(client_cfg, server_cfg, filename, resume_from=0)
+
+    print()
+
+
 # --- interactive cli ---
 
 def interactive_cli(client_cfg, server_cfg):
@@ -494,6 +560,8 @@ def main():
     server_thread.daemon = True
     server_thread.start()
 
+    resume_incomplete_downloads(client_cfg, server_cfg)
+    
     # background thread for periodic tracker updates
     update_thread = threading.Thread(
         target=periodic_update,
@@ -501,6 +569,8 @@ def main():
     )
     update_thread.daemon = True
     update_thread.start()
+    
+    
 
     interactive_cli(client_cfg, server_cfg)
 

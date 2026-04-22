@@ -178,3 +178,17 @@ make demo
 ```
 
 Runs `demo.py` which starts all components automatically and tests the full protocol flow including file transfers and MD5 verification.
+
+## Remaining Work
+
+1. **Periodic incomplete-file re-check** — the periodic update thread currently only sends updatetracker for files already fully present. It should also detect incomplete files, re-fetch the latest tracker for those files from the server, and resume downloading the remaining bytes.
+
+2. **Final demo starter script** — a timed script is needed that: starts the server and 2 seed peers at t=0, starts peers 3–8 at t=30s (each runs LIST then GET for both files), starts peers 9–13 at t=90s following the same flow, then terminates peer1 and peer2 printing a termination message.
+
+3. **Demo large-file chunk bug** — the current demo.py sends one request for the entire large file in a single shot, which the peer server rejects since it enforces the 1024-byte limit. The demo needs to request the file in 1024-byte chunks.
+
+4. **Stale tracker re-fetch on all-peers-fail** — when every peer in the tracker file is unreachable, the download currently gives up. It should re-fetch a fresh tracker from the server and retry with any newly listed peers.
+
+5. **Dead peer removal** — pruning of dead peers only happens during an updatetracker call. The spec requires a peer to be considered dead after exactly one missed update interval, and removal should not depend on another peer triggering an update.
+
+6. **Large file size for final demo** — the Makefile generates a 100KB file. The final demo requires the large file to take at least 1 min 20 sec to download, so the file needs to be significantly larger.
