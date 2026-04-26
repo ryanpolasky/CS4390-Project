@@ -14,7 +14,8 @@ def read_config():
         lines = [l.strip() for l in f.readlines() if l.strip()]
     port = int(lines[0])
     torrents_dir = lines[1]
-    return port, torrents_dir
+    update_interval = int(lines[2])
+    return port, torrents_dir, update_interval
 
 
 def parse_tracker_file(filepath):
@@ -120,9 +121,6 @@ def handle_updatetracker(parts, torrents_dir, update_interval=900):
         info, peers = parse_tracker_file(track_path)
         current_time = int(time.time())
 
-        # kill off dead peers that havent updated in a while
-        peers = [p for p in peers if current_time - int(p["timestamp"]) < update_interval * 2]
-
         # check if this peer already has an entry, if so just update it
         found = False
         for p in peers:
@@ -148,6 +146,53 @@ def handle_updatetracker(parts, torrents_dir, update_interval=900):
     except Exception as e:
         print(f"  [TRACKER] Error updating tracker: {e}")
         return f"<updatetracker {filename} fail>\n"
+
+
+#Perodic peer pruning, default interval at 900
+#By default called with interval value in sconfig (line 3)
+def periodic_cleanup(torrents_dir, update_interval=900):
+    #Background thread, checks every interval
+    file_lock = threading.Lock()
+
+    while True:
+        # sleep first so we don't run immediately at startup before any peers
+        # have had a chance to register
+        time.sleep(update_interval)
+
+        current_time = int(time.time())
+        print(f"[CLEANUP] Running periodic dead-peer sweep at {current_time}...")
+
+        try:
+            track_files = [
+                f for f in os.listdir(torrents_dir) if f.endswith(".track")
+            ]
+        except Exception as e:
+            print(f"[CLEANUP] Could not list torrents dir: {e}")
+            continue
+
+        for tf in track_files:
+            track_path = os.path.join(torrents_dir, tf)
+            try:
+                with file_lock:
+                    info, peers = parse_tracker_file(track_path)
+
+                    live = [
+                        p for p in peers
+                        if current_time - int(p["timestamp"]) < update_interval
+                    ]
+                    dead_count = len(peers) - len(live)
+
+                    if dead_count > 0:
+                        write_tracker_file(track_path, info, live)
+                        print(
+                            f"[CLEANUP] {tf}: removed {dead_count} dead peer(s), "
+                            f"{len(live)} remaining"
+                        )
+            except Exception as e:
+                print(f"[CLEANUP] Error processing {tf}: {e}")
+
+        print("[CLEANUP] Sweep complete.")
+
 
 
 def handle_list(torrents_dir):
@@ -238,7 +283,7 @@ def handle_client(conn, addr, torrents_dir):
 
 
 def main():
-    port, torrents_dir = read_config()
+    port, torrents_dir, update_interval = read_config()
     os.makedirs(torrents_dir, exist_ok=True)
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -249,6 +294,11 @@ def main():
     print(f"[TRACKER] Server listening on port {port}")
     print(f"[TRACKER] Tracker files stored in: {torrents_dir}/")
     print("[TRACKER] Ready to accept connections...")
+
+    #Starting periodic cleanup thread
+    cleanup_thread = threading.Thread(target=periodic_cleanup, args=(torrents_dir, update_interval))
+    cleanup_thread.deamon = True
+    cleanup_thread.start()
 
     try:
         while True:
