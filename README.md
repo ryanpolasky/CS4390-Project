@@ -191,4 +191,4 @@ Runs `demo.py` which starts all components automatically and tests the full prot
 
 5. **Dead peer removal** — pruning of dead peers only happens during an updatetracker call. The spec requires a peer to be considered dead after exactly one missed update interval, and removal should not depend on another peer triggering an update.
 
-6. **Large file size for final demo** — the Makefile generates a 100KB file. The final demo requires the large file to take at least 1 min 20 sec to download, so the file needs to be significantly larger.
+6. **Large file size bug for final demo** — The final demo requires the large file to take at least 1 min 20 sec to download. For files large enough to satisfy that client peers request chunks fast enough that the OS runs out of ephemeral ports to assign and a connection refused error is gotten.
