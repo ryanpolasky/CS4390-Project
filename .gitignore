@@ -212,3 +212,4 @@ peer1/cache/
 peer2/cache/
 peer3/cache/
 peer3/shared/
+peer2/shared/largefile.bin

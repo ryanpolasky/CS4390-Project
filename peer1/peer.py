@@ -26,6 +26,7 @@ def load_server_config():
     return {
         "listen_port": int(lines[0]),
         "shared_folder": lines[1],
+        "chunk_delay": float(lines[2]) if len(lines) > 2 else 0.0,  # optional artificial delay per chunk served
     }
 
 
@@ -427,7 +428,7 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks
 # --- peer server thread ---
 # this is what other peers connect to when they want chunks from us
 
-def handle_peer_request(conn, addr, shared_folder):
+def handle_peer_request(conn, addr, shared_folder, chunk_delay=0.0):
     print(f"  [SERVER] Connection from peer {addr}")
     try:
         data = conn.recv(4096).decode().strip()
@@ -464,6 +465,8 @@ def handle_peer_request(conn, addr, shared_folder):
             f.seek(start)
             chunk = f.read(end - start)
 
+        if chunk_delay > 0:
+            time.sleep(chunk_delay)  # artificial throttle — must be before sendall so client actually waits
         conn.sendall(chunk)
         print(f"  [SERVER] Sent {len(chunk)} bytes of {filename} to {addr}")
 
@@ -473,7 +476,7 @@ def handle_peer_request(conn, addr, shared_folder):
         conn.close()
 
 
-def start_peer_server(listen_port, shared_folder):
+def start_peer_server(listen_port, shared_folder, chunk_delay=0.0):
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind(("0.0.0.0", listen_port))
@@ -483,7 +486,7 @@ def start_peer_server(listen_port, shared_folder):
     while True:
         try:
             conn, addr = server_sock.accept()
-            t = threading.Thread(target=handle_peer_request, args=(conn, addr, shared_folder))
+            t = threading.Thread(target=handle_peer_request, args=(conn, addr, shared_folder, chunk_delay))
             t.daemon = True
             t.start()
         except Exception:
@@ -674,7 +677,7 @@ def main():
     # server thread - listens for other peers wanting file chunks
     server_thread = threading.Thread(
         target=start_peer_server,
-        args=(server_cfg["listen_port"], server_cfg["shared_folder"])
+        args=(server_cfg["listen_port"], server_cfg["shared_folder"], server_cfg["chunk_delay"])
     )
     server_thread.daemon = True
     server_thread.start()
