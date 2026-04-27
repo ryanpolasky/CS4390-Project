@@ -258,6 +258,7 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
                     chunk += part
 
                 sock.close()
+                time.sleep(0.01)
                 received += chunk
                 offset = chunk_end
                 pct = (len(received)+resume_from) * 100 // filesize if filesize > 0 else 100
