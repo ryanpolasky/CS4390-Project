@@ -196,16 +196,23 @@ def main():
     else:
         print(f"  WARNING: expected {fsize} bytes, got {len(data)}")
 
-    step("peer3 downloads largefile.bin from peer2 (port {})".format(PEER2_PORT))
-    data2 = send_to_peer(PEER2_PORT, f"GET largefile.bin 0 {fsize2}")
+    step("peer3 downloads first 10 chunks of largefile.bin from peer2 (port {})".format(PEER2_PORT))
+    CHUNK_SIZE = 1024
+    DEMO_CHUNKS = 10  # download first 10 chunks to demonstrate the protocol without waiting for full 10MB
+    data2 = b""
+    for i in range(DEMO_CHUNKS):
+        chunk_start = i * CHUNK_SIZE
+        chunk_end = min(chunk_start + CHUNK_SIZE, fsize2)
+        chunk = send_to_peer(PEER2_PORT, f"GET largefile.bin {chunk_start} {chunk_end}")
+        data2 += chunk
+        print(f"  << chunk {i+1}/{DEMO_CHUNKS}: bytes {chunk_start}-{chunk_end}, got {len(chunk)} bytes")
     out_path2 = os.path.join(out_dir, "largefile.bin")
     with open(out_path2, "wb") as f:
         f.write(data2)
-    print(f"  << received {len(data2)} bytes, saved to peer3/shared/largefile.bin")
-    if len(data2) == fsize2:
-        received_md5 = hashlib.md5(data2).hexdigest()
-        match = "MATCH" if received_md5 == md5_2 else "MISMATCH"
-        print(f"  md5 check: {match}")
+    expected = min(DEMO_CHUNKS * CHUNK_SIZE, fsize2)
+    print(f"  << total received {len(data2)}/{expected} bytes, saved to peer3/shared/largefile.bin")
+    if len(data2) == expected:
+        print(f"  chunk transfer: PASS ({DEMO_CHUNKS} × {CHUNK_SIZE}-byte chunks)")
 
     # --- done ---
     log("DEMO COMPLETE", "DONE")

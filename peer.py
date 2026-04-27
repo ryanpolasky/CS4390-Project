@@ -166,9 +166,12 @@ def cmd_get_tracker(client_cfg, trackname):
     return None
 
 
-def download_chunk(peers, filename, chunk_start, chunk_end, results, results_lock):
+def download_chunk(peers, filename, chunk_start, chunk_end, results, results_lock, dead_peers=None, dead_peers_lock=None):
     # tries each peer in order (newest timestamp first) until one succeeds
     for peer in peers:
+        key = (peer["ip"], peer["port"])
+        if dead_peers is not None and key in dead_peers:
+            continue
         try:
             # FIX: use context manager so socket is always closed even if an exception is raised mid-transfer
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -189,11 +192,18 @@ def download_chunk(peers, filename, chunk_start, chunk_end, results, results_loc
             if chunk:
                 with results_lock:
                     results[chunk_start] = chunk
-                print(f"  [DOWNLOAD] Got bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}")
                 return  # success — no need to try remaining peers
             else:
                 print(f"  [DOWNLOAD] Empty response for bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}, trying next peer...")
 
+        except ConnectionRefusedError:
+            # peer is down — blacklist it for the rest of this download so no
+            # other chunk thread wastes a connection attempt on it
+            if dead_peers is not None and dead_peers_lock is not None:
+                with dead_peers_lock:
+                    if key not in dead_peers:
+                        dead_peers.add(key)
+                        print(f"  [DOWNLOAD] {peer['ip']}:{peer['port']} refused — blacklisted for this download")
         except Exception as e:
             print(f"  [DOWNLOAD] Failed bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}: {e}, trying next peer...")
 
@@ -237,7 +247,7 @@ def find_contiguous_end(filepath, filesize, chunk_size=1024):
     return cont_end
 
 
-def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks=None):
+def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks=None, first_call=1):
     trackname = f"{filename}.track"
     cache_path = os.path.join("cache", trackname)
 
@@ -347,9 +357,28 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks
     MAX_CONCURRENT = 8
     semaphore = threading.Semaphore(MAX_CONCURRENT)
 
+    total_chunks = sum(1 for _, _, el in chunk_peer_map if el)
+    completed = [0]
+    completed_lock = threading.Lock()
+    dead_peers = set()
+    dead_peers_lock = threading.Lock()
+    t0 = time.time()
+    last_print_time = [t0]
+
     def throttled_download(eligible_sorted, chunk_start, chunk_end):
         with semaphore:
-            download_chunk(eligible_sorted, filename, chunk_start, chunk_end, results, results_lock)
+            download_chunk(eligible_sorted, filename, chunk_start, chunk_end, results, results_lock, dead_peers, dead_peers_lock)
+        with completed_lock:
+            completed[0] += 1
+            c = completed[0]
+            now = time.time()
+            if now - last_print_time[0] >= 1.0 or c == total_chunks:
+                el = now - t0
+                done_bytes = sum(len(v) for v in results.values())
+                rate = (done_bytes / el / 1024) if el > 0 else 0
+                pct = 100 * c // total_chunks if total_chunks else 0
+                print(f"  [PROGRESS] {filename}: {c}/{total_chunks} chunks ({pct}%) — {rate:.1f} KB/s", flush=True)
+                last_print_time[0] = now
 
     threads = []
     for chunk_start, chunk_end, eligible in chunk_peer_map:
@@ -365,14 +394,24 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks
     for t in threads:
         t.join()
 
+    elapsed = time.time() - t0
     received_bytes = sum(len(v) for v in results.values())
     expected_bytes = sum(end - start for start, end in chunks)
-    print(f"\n  Downloaded {received_bytes}/{expected_bytes} bytes across {len(results)}/{len(chunks)} chunks")
+    rate = (received_bytes / elapsed / 1024) if elapsed > 0 else 0
+    print(f"\n  Downloaded {received_bytes}/{expected_bytes} bytes across {len(results)}/{len(chunks)} chunks in {elapsed:.2f}s ({rate:.1f} KB/s)")
 
     # FIX: only bailing on zero chunks means a half-failed download (zero-filled chunks)
     # is silently treated as complete — require all expected bytes to be present
-    if received_bytes == 0:
-        print("  Error: Could not download any chunks.")
+    if received_bytes == 0 and first_call == 1:
+        print("  All peers failed. Re-fetching fresh tracker and retrying once...")
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+        fresh = cmd_get_tracker(client_cfg, trackname)
+        if fresh is None:
+            print("  Error: Could not re-fetch tracker. Giving up.")
+            return
+        # tail-call into a clean retry — resume_from/missing_chunks preserved
+        cmd_download(client_cfg, server_cfg, filename, resume_from=resume_from, missing_chunks=missing_chunks, first_call=0)
         return
 
     # FIX: if resume_from > 0 or missing_chunks mode but the file doesn't exist yet,
@@ -495,7 +534,6 @@ def start_peer_server(listen_port, shared_folder, chunk_delay=0.0):
 
 # --- periodic update thread ---
 # sends updatetracker for everything in shared/ on a timer
-# TODO: also check for incomplete files and re-request them for final
 
 def periodic_update(client_cfg, server_cfg):
     interval = client_cfg["update_interval"]

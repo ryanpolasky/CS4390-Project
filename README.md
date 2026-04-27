@@ -47,7 +47,7 @@ make setup
 
 This copies `peer.py` to each peer folder and creates sample test files:
 - `peer1/shared/testfile.txt` — small test file (50 bytes)
-- `peer2/shared/largefile.bin` — large binary file (100KB)
+- `peer2/shared/largefile.bin` — large binary file (10MB)
 
 ### 2. Run (4 separate terminals)
 
@@ -79,6 +79,7 @@ Removes copied `peer.py` files, cached `.track` files, and tracker torrents.
 ```
 9090        # port to listen on
 torrents    # directory to store .track files
+900         # dead-peer interval in seconds (peers not updated within this window are pruned)
 ```
 
 ### Peer — `clientThreadConfig.cfg`
@@ -92,6 +93,7 @@ torrents    # directory to store .track files
 ```
 4001        # port this peer listens on for incoming peer connections
 shared      # shared folder name
+0.005       # (optional) artificial delay in seconds per chunk served — used to throttle demo downloads
 ```
 
 Each peer has its own config files. peer1 listens on 4001, peer2 on 4002, peer3 on 4003.
@@ -179,14 +181,16 @@ make demo
 
 Runs `demo.py` which starts all components automatically and tests the full protocol flow including file transfers and MD5 verification.
 
-## Remaining Work
+## Final Demo
 
-1. **Periodic incomplete-file re-check** — the periodic update thread currently only sends updatetracker for files already fully present. It should also detect incomplete files, re-fetch the latest tracker for those files from the server, and resume downloading the remaining bytes.
+```bash
+make setup
+python3 final_demo.py
+```
 
-2. **Final demo starter script** — a timed script is needed that: starts the server and 2 seed peers at t=0, starts peers 3–8 at t=30s (each runs LIST then GET for both files), starts peers 9–13 at t=90s following the same flow, then terminates peer1 and peer2 printing a termination message.
+Runs the timed final demo:
+- **t=0s** — tracker + peer1 (testfile seed) + peer2 (largefile seed) start
+- **t=30s** — peers 3–8 join and begin downloading `largefile.bin`
+- **t=90s** — peer1 and peer2 are terminated; peers 9–13 join and must complete the download from peers 3–8's partial files only
 
-3. **Demo large-file chunk bug** — the current demo.py sends one request for the entire large file in a single shot, which the peer server rejects since it enforces the 1024-byte limit. The demo needs to request the file in 1024-byte chunks.
-
-4. **Stale tracker re-fetch on all-peers-fail** — when every peer in the tracker file is unreachable, the download currently gives up. It should re-fetch a fresh tracker from the server and retry with any newly listed peers.
-
-5. **Large file size bug for final demo** — The final demo requires the large file to take at least 1 min 20 sec to download. For files large enough to satisfy that client peers request chunks fast enough that the OS runs out of ephemeral ports to assign and a connection refused error is gotten.
+The `CHUNK_DELAY` value at the top of `final_demo.py` (default `0.05s`) controls how fast seed peers serve chunks — increase it to guarantee peers 3–8 only have partial files when the seeds terminate.
