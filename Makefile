@@ -12,7 +12,7 @@ setup:
 	@cp $(PEER_SRC) peer3/peer.py
 	@echo "Creating sample test files..."
 	@echo "Hello, this is a small test file for P2P sharing." > peer1/shared/testfile.txt
-	@dd if=/dev/urandom of=peer2/shared/largefile.bin bs=1024 count=100 2>/dev/null
+	@dd if=/dev/urandom of=peer2/shared/largefile.bin bs=1024 count=10240 2>/dev/null
 	@echo "Setup complete!"
 	@echo ""
 	@echo "To run:"
