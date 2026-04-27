@@ -25,6 +25,7 @@ clean:
 	@rm -f peer1/peer.py peer2/peer.py peer3/peer.py
 	@rm -rf peer1/cache peer2/cache peer3/cache
 	@rm -rf tracker/torrents/*.track
+	@rm -rf _peer*
 	@echo "Cleaned."
 
 run-tracker:

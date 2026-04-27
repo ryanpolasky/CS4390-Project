@@ -372,7 +372,15 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks
     # FIX: only bailing on zero chunks means a half-failed download (zero-filled chunks)
     # is silently treated as complete — require all expected bytes to be present
     if received_bytes == 0:
-        print("  Error: Could not download any chunks.")
+        print("  All peers failed. Re-fetching fresh tracker and retrying once...")
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+        fresh = cmd_get_tracker(client_cfg, trackname)
+        if fresh is None:
+            print("  Error: Could not re-fetch tracker. Giving up.")
+            return
+        # tail-call into a clean retry — resume_from/missing_chunks preserved
+        cmd_download(client_cfg, server_cfg, filename, resume_from=resume_from, missing_chunks=missing_chunks)
         return
 
     # FIX: if resume_from > 0 or missing_chunks mode but the file doesn't exist yet,
@@ -495,7 +503,6 @@ def start_peer_server(listen_port, shared_folder, chunk_delay=0.0):
 
 # --- periodic update thread ---
 # sends updatetracker for everything in shared/ on a timer
-# TODO: also check for incomplete files and re-request them for final
 
 def periodic_update(client_cfg, server_cfg):
     interval = client_cfg["update_interval"]
