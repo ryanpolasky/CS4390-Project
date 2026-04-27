@@ -8,6 +8,7 @@ import os
 import time
 import hashlib
 
+file_lock = threading.Lock()
 
 def read_config():
     with open("sconfig", "r") as f:
@@ -19,90 +20,71 @@ def read_config():
 
 
 def parse_tracker_file(filepath):
-    # reads a .track file, pulls out the metadata fields and the peer list
     info = {}
     peers = []
-    with open(filepath, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("Filename:"):
-                info["filename"] = line.split(":", 1)[1].strip()
-            elif line.startswith("Filesize:"):
-                info["filesize"] = line.split(":", 1)[1].strip()
-            elif line.startswith("Description:"):
-                info["description"] = line.split(":", 1)[1].strip()
-            elif line.startswith("MD5:"):
-                info["md5"] = line.split(":", 1)[1].strip()
-            elif ":" in line and not line.startswith("<"):
-                # ip:port:start:end:timestamp format
-                parts = line.split(":")
-                if len(parts) == 5:
-                    peers.append({
-                        "ip": parts[0],
-                        "port": parts[1],
-                        "start": parts[2],
-                        "end": parts[3],
-                        "timestamp": parts[4]
-                    })
+
+    with file_lock:
+        with open(filepath, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("Filename:"):
+                    info["filename"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Filesize:"):
+                    info["filesize"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Description:"):
+                    info["description"] = line.split(":", 1)[1].strip()
+                elif line.startswith("MD5:"):
+                    info["md5"] = line.split(":", 1)[1].strip()
+                elif ":" in line and not line.startswith("<"):
+                    parts = line.split(":")
+                    if len(parts) == 5:
+                        peers.append({
+                            "ip": parts[0],
+                            "port": parts[1],
+                            "start": parts[2],
+                            "end": parts[3],
+                            "timestamp": parts[4]
+                        })
     return info, peers
 
 
 def write_tracker_file(filepath, info, peers):
-    with open(filepath, "w") as f:
-        f.write(f"Filename: {info['filename']}\n")
-        f.write(f"Filesize: {info['filesize']}\n")
-        f.write(f"Description: {info.get('description', '')}\n")
-        f.write(f"MD5: {info['md5']}\n")
-        f.write("#list of peers follows next\n")
-        for p in peers:
-            f.write(f"{p['ip']}:{p['port']}:{p['start']}:{p['end']}:{p['timestamp']}\n")
+    with file_lock:
+        with open(filepath, "w") as f:
+            f.write(f"Filename: {info['filename']}\n")
+            f.write(f"Filesize: {info['filesize']}\n")
+            f.write(f"Description: {info.get('description', '')}\n")
+            f.write(f"MD5: {info['md5']}\n")
+            f.write("#list of peers follows next\n")
+            for p in peers:
+                f.write(f"{p['ip']}:{p['port']}:{p['start']}:{p['end']}:{p['timestamp']}\n")
 
 
 def handle_createtracker(parts, torrents_dir):
-    # expecting: createtracker filename filesize description md5 ip port
-    if len(parts) < 7:
-        return "<createtracker fail>\n"
-
-    filename = parts[1]
-    filesize = parts[2]
-    description = parts[3]
-    md5 = parts[4]
-    ip = parts[5]
-    port = parts[6]
-
+    ...
     track_path = os.path.join(torrents_dir, f"{filename}.track")
 
-    # already exists = ferr per the protocol spec
-    if os.path.exists(track_path):
-        return "<createtracker ferr>\n"
-
     try:
-        timestamp = str(int(time.time()))
-        info = {
-            "filename": filename,
-            "filesize": filesize,
-            "description": description,
-            "md5": md5,
-        }
-        peers = [{
-            "ip": ip,
-            "port": port,
-            "start": "0",
-            "end": filesize,
-            "timestamp": timestamp,
-        }]
-        write_tracker_file(track_path, info, peers)
+        with file_lock:
+            if os.path.exists(track_path):
+                return "<createtracker ferr>\n"
+
+            timestamp = str(int(time.time()))
+            info = {...}
+            peers = [...]
+
+            write_tracker_file(track_path, info, peers)
+
         print(f"  [TRACKER] Created tracker file: {filename}.track")
         return "<createtracker succ>\n"
+
     except Exception as e:
-        print(f"  [TRACKER] Error creating tracker: {e}")
-        return "<createtracker fail>\n"
+        ...
 
 
 def handle_updatetracker(parts, torrents_dir, update_interval=900):
-    # expecting: updatetracker filename start_bytes end_bytes ip port
     if len(parts) < 6:
         return "<updatetracker fail>\n"
 
@@ -118,41 +100,42 @@ def handle_updatetracker(parts, torrents_dir, update_interval=900):
         return f"<updatetracker {filename} ferr>\n"
 
     try:
-        info, peers = parse_tracker_file(track_path)
-        current_time = int(time.time())
+        with file_lock:
+            info, peers = parse_tracker_file(track_path)
 
-        # check if this peer already has an entry, if so just update it
-        found = False
-        for p in peers:
-            if p["ip"] == ip and p["port"] == port:
-                p["start"] = start_bytes
-                p["end"] = end_bytes
-                p["timestamp"] = str(current_time)
-                found = True
-                break
+            current_time = int(time.time())
 
-        if not found:
-            peers.append({
-                "ip": ip,
-                "port": port,
-                "start": start_bytes,
-                "end": end_bytes,
-                "timestamp": str(current_time),
-            })
+            found = False
+            for p in peers:
+                if p["ip"] == ip and p["port"] == port:
+                    p["start"] = start_bytes
+                    p["end"] = end_bytes
+                    p["timestamp"] = str(current_time)
+                    found = True
+                    break
 
-        write_tracker_file(track_path, info, peers)
+            if not found:
+                peers.append({
+                    "ip": ip,
+                    "port": port,
+                    "start": start_bytes,
+                    "end": end_bytes,
+                    "timestamp": str(current_time),
+                })
+
+            write_tracker_file(track_path, info, peers)
+
         print(f"  [TRACKER] Updated tracker: {filename}.track for peer {ip}:{port}")
         return f"<updatetracker {filename} succ>\n"
+
     except Exception as e:
         print(f"  [TRACKER] Error updating tracker: {e}")
         return f"<updatetracker {filename} fail>\n"
-
 
 #Perodic peer pruning, default interval at 900
 #By default called with interval value in sconfig (line 3)
 def periodic_cleanup(torrents_dir, update_interval=900):
     #Background thread, checks every interval
-    file_lock = threading.Lock()
 
     while True:
         # sleep first so we don't run immediately at startup before any peers
@@ -172,6 +155,7 @@ def periodic_cleanup(torrents_dir, update_interval=900):
 
         for tf in track_files:
             track_path = os.path.join(torrents_dir, tf)
+
             try:
                 with file_lock:
                     info, peers = parse_tracker_file(track_path)
@@ -180,6 +164,7 @@ def periodic_cleanup(torrents_dir, update_interval=900):
                         p for p in peers
                         if current_time - int(p["timestamp"]) < update_interval
                     ]
+
                     dead_count = len(peers) - len(live)
 
                     if dead_count > 0:
