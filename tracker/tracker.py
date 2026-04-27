@@ -297,7 +297,7 @@ def main():
 
     #Starting periodic cleanup thread
     cleanup_thread = threading.Thread(target=periodic_cleanup, args=(torrents_dir, update_interval))
-    cleanup_thread.deamon = True
+    cleanup_thread.daemon = True
     cleanup_thread.start()
 
     try:
