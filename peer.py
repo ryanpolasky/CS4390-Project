@@ -237,7 +237,7 @@ def find_contiguous_end(filepath, filesize, chunk_size=1024):
     return cont_end
 
 
-def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks=None):
+def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks=None, first_call=1):
     trackname = f"{filename}.track"
     cache_path = os.path.join("cache", trackname)
 
@@ -371,7 +371,7 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks
 
     # FIX: only bailing on zero chunks means a half-failed download (zero-filled chunks)
     # is silently treated as complete — require all expected bytes to be present
-    if received_bytes == 0:
+    if received_bytes == 0 and first_call == 1:
         print("  All peers failed. Re-fetching fresh tracker and retrying once...")
         if os.path.exists(cache_path):
             os.remove(cache_path)
@@ -380,7 +380,7 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks
             print("  Error: Could not re-fetch tracker. Giving up.")
             return
         # tail-call into a clean retry — resume_from/missing_chunks preserved
-        cmd_download(client_cfg, server_cfg, filename, resume_from=resume_from, missing_chunks=missing_chunks)
+        cmd_download(client_cfg, server_cfg, filename, resume_from=resume_from, missing_chunks=missing_chunks, first_call=0)
         return
 
     # FIX: if resume_from > 0 or missing_chunks mode but the file doesn't exist yet,
