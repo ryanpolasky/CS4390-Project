@@ -189,6 +189,4 @@ Runs `demo.py` which starts all components automatically and tests the full prot
 
 4. **Stale tracker re-fetch on all-peers-fail** — when every peer in the tracker file is unreachable, the download currently gives up. It should re-fetch a fresh tracker from the server and retry with any newly listed peers.
 
-5. **Dead peer removal** — pruning of dead peers only happens during an updatetracker call. The spec requires a peer to be considered dead after exactly one missed update interval, and removal should not depend on another peer triggering an update.
-
-6. **Large file size bug for final demo** — The final demo requires the large file to take at least 1 min 20 sec to download. For files large enough to satisfy that client peers request chunks fast enough that the OS runs out of ephemeral ports to assign and a connection refused error is gotten.
+5. **Large file size bug for final demo** — The final demo requires the large file to take at least 1 min 20 sec to download. For files large enough to satisfy that client peers request chunks fast enough that the OS runs out of ephemeral ports to assign and a connection refused error is gotten.

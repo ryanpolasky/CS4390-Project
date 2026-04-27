@@ -8,17 +8,20 @@ import os
 import time
 import hashlib
 
+file_lock = threading.Lock()
+
 
 def read_config():
     with open("sconfig", "r") as f:
         lines = [l.strip() for l in f.readlines() if l.strip()]
     port = int(lines[0])
     torrents_dir = lines[1]
-    return port, torrents_dir
+    update_interval = int(lines[2])
+    return port, torrents_dir, update_interval
 
 
 def parse_tracker_file(filepath):
-    # reads a .track file, pulls out the metadata fields and the peer list
+    # raw I/O helper — callers must hold file_lock
     info = {}
     peers = []
     with open(filepath, "r") as f:
@@ -35,7 +38,6 @@ def parse_tracker_file(filepath):
             elif line.startswith("MD5:"):
                 info["md5"] = line.split(":", 1)[1].strip()
             elif ":" in line and not line.startswith("<"):
-                # ip:port:start:end:timestamp format
                 parts = line.split(":")
                 if len(parts) == 5:
                     peers.append({
@@ -49,6 +51,7 @@ def parse_tracker_file(filepath):
 
 
 def write_tracker_file(filepath, info, peers):
+    # raw I/O helper — callers must hold file_lock
     with open(filepath, "w") as f:
         f.write(f"Filename: {info['filename']}\n")
         f.write(f"Filesize: {info['filesize']}\n")
@@ -73,28 +76,30 @@ def handle_createtracker(parts, torrents_dir):
 
     track_path = os.path.join(torrents_dir, f"{filename}.track")
 
-    # already exists = ferr per the protocol spec
-    if os.path.exists(track_path):
-        return "<createtracker ferr>\n"
-
     try:
-        timestamp = str(int(time.time()))
-        info = {
-            "filename": filename,
-            "filesize": filesize,
-            "description": description,
-            "md5": md5,
-        }
-        peers = [{
-            "ip": ip,
-            "port": port,
-            "start": "0",
-            "end": filesize,
-            "timestamp": timestamp,
-        }]
-        write_tracker_file(track_path, info, peers)
+        with file_lock:
+            if os.path.exists(track_path):
+                return "<createtracker ferr>\n"
+
+            timestamp = str(int(time.time()))
+            info = {
+                "filename": filename,
+                "filesize": filesize,
+                "description": description,
+                "md5": md5,
+            }
+            peers = [{
+                "ip": ip,
+                "port": port,
+                "start": "0",
+                "end": filesize,
+                "timestamp": timestamp,
+            }]
+            write_tracker_file(track_path, info, peers)
+
         print(f"  [TRACKER] Created tracker file: {filename}.track")
         return "<createtracker succ>\n"
+
     except Exception as e:
         print(f"  [TRACKER] Error creating tracker: {e}")
         return "<createtracker fail>\n"
@@ -117,37 +122,73 @@ def handle_updatetracker(parts, torrents_dir, update_interval=900):
         return f"<updatetracker {filename} ferr>\n"
 
     try:
-        info, peers = parse_tracker_file(track_path)
-        current_time = int(time.time())
+        with file_lock:
+            info, peers = parse_tracker_file(track_path)
+            current_time = int(time.time())
 
-        # kill off dead peers that havent updated in a while
-        peers = [p for p in peers if current_time - int(p["timestamp"]) < update_interval * 2]
+            found = False
+            for p in peers:
+                if p["ip"] == ip and p["port"] == port:
+                    p["start"] = start_bytes
+                    p["end"] = end_bytes
+                    p["timestamp"] = str(current_time)
+                    found = True
+                    break
 
-        # check if this peer already has an entry, if so just update it
-        found = False
-        for p in peers:
-            if p["ip"] == ip and p["port"] == port:
-                p["start"] = start_bytes
-                p["end"] = end_bytes
-                p["timestamp"] = str(current_time)
-                found = True
-                break
+            if not found:
+                peers.append({
+                    "ip": ip,
+                    "port": port,
+                    "start": start_bytes,
+                    "end": end_bytes,
+                    "timestamp": str(current_time),
+                })
 
-        if not found:
-            peers.append({
-                "ip": ip,
-                "port": port,
-                "start": start_bytes,
-                "end": end_bytes,
-                "timestamp": str(current_time),
-            })
+            write_tracker_file(track_path, info, peers)
 
-        write_tracker_file(track_path, info, peers)
         print(f"  [TRACKER] Updated tracker: {filename}.track for peer {ip}:{port}")
         return f"<updatetracker {filename} succ>\n"
+
     except Exception as e:
         print(f"  [TRACKER] Error updating tracker: {e}")
         return f"<updatetracker {filename} fail>\n"
+
+
+def periodic_cleanup(torrents_dir, update_interval=900):
+    while True:
+        # sleep first so we don't run immediately at startup before any peers
+        # have had a chance to register
+        time.sleep(update_interval)
+
+        current_time = int(time.time())
+        print(f"[CLEANUP] Running periodic dead-peer sweep at {current_time}...")
+
+        try:
+            track_files = [f for f in os.listdir(torrents_dir) if f.endswith(".track")]
+        except Exception as e:
+            print(f"[CLEANUP] Could not list torrents dir: {e}")
+            continue
+
+        for tf in track_files:
+            track_path = os.path.join(torrents_dir, tf)
+            try:
+                with file_lock:
+                    info, peers = parse_tracker_file(track_path)
+                    live = [
+                        p for p in peers
+                        if current_time - int(p["timestamp"]) < update_interval
+                    ]
+                    dead_count = len(peers) - len(live)
+                    if dead_count > 0:
+                        write_tracker_file(track_path, info, live)
+                        print(
+                            f"[CLEANUP] {tf}: removed {dead_count} dead peer(s), "
+                            f"{len(live)} remaining"
+                        )
+            except Exception as e:
+                print(f"[CLEANUP] Error processing {tf}: {e}")
+
+        print("[CLEANUP] Sweep complete.")
 
 
 def handle_list(torrents_dir):
@@ -157,7 +198,8 @@ def handle_list(torrents_dir):
     response = f"<REP LIST {count}>\n"
     for i, tf in enumerate(track_files, 1):
         track_path = os.path.join(torrents_dir, tf)
-        info, _ = parse_tracker_file(track_path)
+        with file_lock:
+            info, _ = parse_tracker_file(track_path)
         fname = info.get("filename", tf.replace(".track", ""))
         fsize = info.get("filesize", "0")
         fmd5 = info.get("md5", "")
@@ -176,8 +218,9 @@ def handle_get(parts, torrents_dir):
     if not os.path.exists(track_path):
         return "<GET invalid>\n"
 
-    with open(track_path, "r") as f:
-        content = f.read()
+    with file_lock:
+        with open(track_path, "r") as f:
+            content = f.read()
 
     file_md5 = hashlib.md5(content.encode()).hexdigest()
 
@@ -238,7 +281,7 @@ def handle_client(conn, addr, torrents_dir):
 
 
 def main():
-    port, torrents_dir = read_config()
+    port, torrents_dir, update_interval = read_config()
     os.makedirs(torrents_dir, exist_ok=True)
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -250,10 +293,13 @@ def main():
     print(f"[TRACKER] Tracker files stored in: {torrents_dir}/")
     print("[TRACKER] Ready to accept connections...")
 
+    cleanup_thread = threading.Thread(target=periodic_cleanup, args=(torrents_dir, update_interval))
+    cleanup_thread.daemon = True
+    cleanup_thread.start()
+
     try:
         while True:
             conn, addr = server_sock.accept()
-            # spin up a new thread per connection
             t = threading.Thread(target=handle_client, args=(conn, addr, torrents_dir))
             t.daemon = True
             t.start()
