@@ -32,13 +32,14 @@ final-setup:
 	@echo "Creating sample test files for Peer1 and Peer2..."
 	@echo "Hello, this is a small test file for P2P sharing." > peer1/shared/testfile.txt
 	@echo "Small file size: $$(wc -c < peer1/shared/testfile.txt) bytes"
-	@dd if=/dev/urandom of=peer2/shared/largefile.bin bs=1024 count=100 2>/dev/null
+	@dd if=/dev/urandom of=peer2/shared/largefile.bin bs=1024 count=2000 2>/dev/null
 	@echo "Large file size: $$(wc -c < peer2/shared/largefile.bin) bytes"
 	@echo ""
 	@echo "Final demo setup complete!"
 	@echo ""
 	@echo "To run the final demo:"
-	@echo "  $(PYTHON) final_demo.py"
+	@echo "  make final-demo"
+	@echo "  optional: add '|& tee final_demo.log' to the command to save output to a log file"
 
 clean:
 	@echo "Cleaning up peer directories..."

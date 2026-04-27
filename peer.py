@@ -10,7 +10,6 @@ import sys
 import hashlib
 import time
 
-
 def load_client_config():
     with open("clientThreadConfig.cfg", "r") as f:
         lines = [l.strip() for l in f.readlines() if l.strip()]
@@ -27,6 +26,7 @@ def load_server_config():
     return {
         "listen_port": int(lines[0]),
         "shared_folder": lines[1],
+        "chunk_delay": float(lines[2]) if len(lines) > 2 else 0.0,  # optional artificial delay per chunk served
     }
 
 
@@ -166,9 +166,78 @@ def cmd_get_tracker(client_cfg, trackname):
     return None
 
 
-def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
-    # grabs the tracker file, picks the best peer, downloads the whole file
-    # TODO: multi-threaded chunked download from multiple peers for final
+def download_chunk(peers, filename, chunk_start, chunk_end, results, results_lock):
+    # tries each peer in order (newest timestamp first) until one succeeds
+    for peer in peers:
+        try:
+            # FIX: use context manager so socket is always closed even if an exception is raised mid-transfer
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(15)
+                sock.connect((peer["ip"], peer["port"]))
+
+                request = f"GET {filename} {chunk_start} {chunk_end}\n"
+                sock.sendall(request.encode())
+
+                chunk = b""
+                expected = chunk_end - chunk_start
+                while len(chunk) < expected:
+                    part = sock.recv(expected - len(chunk))
+                    if not part:
+                        break
+                    chunk += part
+
+            if chunk:
+                with results_lock:
+                    results[chunk_start] = chunk
+                print(f"  [DOWNLOAD] Got bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}")
+                return  # success — no need to try remaining peers
+            else:
+                print(f"  [DOWNLOAD] Empty response for bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}, trying next peer...")
+
+        except Exception as e:
+            print(f"  [DOWNLOAD] Failed bytes {chunk_start}-{chunk_end} from {peer['ip']}:{peer['port']}: {e}, trying next peer...")
+
+    print(f"  [DOWNLOAD] All peers exhausted for bytes {chunk_start}-{chunk_end}, chunk unavailable")
+
+
+def scan_null_chunks(filepath, filesize, chunk_size=1024):
+    #helper method that scans for zero filled chunks and returns them as an array
+    #This array is used when completing partial downloads to know which chunks need to be gotten
+    missing = []
+    try:
+        with open(filepath, "rb") as f:
+            offset = 0
+            while offset < filesize:
+                chunk_end = min(offset + chunk_size, filesize)
+                data = f.read(chunk_end - offset)
+                if not data or all(b == 0 for b in data):
+                    missing.append((offset, chunk_end))
+                offset = chunk_end
+    except Exception as e:
+        print(f"  [SCAN] Error scanning {filepath}: {e}")
+    return missing
+
+
+def find_contiguous_end(filepath, filesize, chunk_size=1024):
+    #Since tracker format only allows ranges, find largest range of
+    #continuous bytes from 0 to report to tracker when updating
+    cont_end = 0
+    try:
+        with open(filepath, "rb") as f:
+            offset = 0
+            while offset < filesize:
+                chunk_end = min(offset + chunk_size, filesize)
+                data = f.read(chunk_end - offset)
+                if not data or all(b == 0 for b in data):
+                    break
+                cont_end = chunk_end
+                offset = chunk_end
+    except Exception as e:
+        print(f"  [SCAN] Error finding contiguous end in {filepath}: {e}")
+    return cont_end
+
+
+def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks=None):
     trackname = f"{filename}.track"
     cache_path = os.path.join("cache", trackname)
 
@@ -202,7 +271,20 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
         print("  No peers available for this file.")
         return
 
-    # newest timestamp = freshest peer, try that one first
+    # remove ourselves from the peer list
+    self_ip = get_my_ip()  # or detect it
+    self_port = server_cfg["listen_port"]
+
+    peers = [
+        p for p in peers
+        if not (p["ip"] == self_ip and p["port"] == self_port)
+    ]
+
+    if not peers:
+        print("  No external peers available for this file.")
+        return
+
+    # sort by newest timestamp — freshest peers first
     peers.sort(key=lambda p: p["timestamp"], reverse=True)
 
     filesize = 0
@@ -210,6 +292,20 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
         if line.startswith("Filesize:"):
             filesize = int(line.split(":")[1].strip())
             break
+
+    # FIX: bad/missing tracker metadata would silently succeed writing nothing and call updatetracker
+    if filesize == 0:
+        print(f"  Error: filesize is 0 for {filename}, skipping.")
+        return
+
+    # FIX: empty chunk list would cause an error even though the file may already be complete
+    if resume_from >= filesize:
+        print(f"  {filename} already fully downloaded (resume_from={resume_from} >= filesize={filesize}).")
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+            print(f"  Cache cleaned: {cache_path}")
+        cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
+        return
 
     if resume_from > 0:
         print(f"  File: {filename}, Size: {filesize} bytes (resuming from byte {resume_from})")
@@ -221,87 +317,118 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0):
     os.makedirs(shared, exist_ok=True)
     output_path = os.path.join(shared, filename)
 
-    for peer in peers:
-        # dont try to download from ourselves lol
-        if peer["port"] == server_cfg["listen_port"]:
+    CHUNK_SIZE = 1024
+
+    # build chunk list — if the caller passed in specific null chunks from a
+    # scan, use those directly; otherwise build sequentially from resume_from
+    if missing_chunks is not None:
+        chunks = missing_chunks
+        print(f"  Filling {len(chunks)} null chunk(s) identified by scan")
+    else:
+        chunks = []
+        offset = resume_from
+        while offset < filesize:
+            chunk_end = min(offset + CHUNK_SIZE, filesize)
+            chunks.append((offset, chunk_end))
+            offset = chunk_end
+
+    print(f"  Total chunks to fetch: {len(chunks)}, distributing across {len(peers)} peer(s)")
+
+    results = {}
+    results_lock = threading.Lock()
+
+    chunk_peer_map = []
+    for chunk_start, chunk_end in chunks:
+        eligible = [p for p in peers if p["start"] <= chunk_start < p["end"]]
+        chunk_peer_map.append((chunk_start, chunk_end, eligible))
+
+    # FIX: unbounded thread-per-chunk spawning exhausts ephemeral ports on large files;
+    # semaphore caps concurrent connections so at most MAX_CONCURRENT sockets are open at once
+    MAX_CONCURRENT = 8
+    semaphore = threading.Semaphore(MAX_CONCURRENT)
+
+    def throttled_download(eligible_sorted, chunk_start, chunk_end):
+        with semaphore:
+            download_chunk(eligible_sorted, filename, chunk_start, chunk_end, results, results_lock)
+
+    threads = []
+    for chunk_start, chunk_end, eligible in chunk_peer_map:
+        if not eligible:
             continue
+        # sort eligible peers by newest timestamp so download_chunk tries the
+        # best one first and falls back down the list on failure
+        eligible_sorted = sorted(eligible, key=lambda p: p["timestamp"], reverse=True)
+        t = threading.Thread(target=throttled_download, args=(eligible_sorted, chunk_start, chunk_end))
+        threads.append(t)
+        t.start()
 
-        # skip peers if they do not have a byte window including resume_from 
-        if not peer["start"] <= resume_from < peer["end"]:
-            continue
+    for t in threads:
+        t.join()
 
-        download_start = max(peer["start"], resume_from)
+    received_bytes = sum(len(v) for v in results.values())
+    expected_bytes = sum(end - start for start, end in chunks)
+    print(f"\n  Downloaded {received_bytes}/{expected_bytes} bytes across {len(results)}/{len(chunks)} chunks")
 
-        print(f"  Connecting to peer {peer['ip']}:{peer['port']}...")
-        try:
-            received = b""
-            CHUNK_SIZE = 1024
-            offset = download_start
-            end = peer["end"]
+    # FIX: only bailing on zero chunks means a half-failed download (zero-filled chunks)
+    # is silently treated as complete — require all expected bytes to be present
+    if received_bytes == 0:
+        print("  Error: Could not download any chunks.")
+        return
 
-            while offset < end:
-                chunk_end = min(offset + CHUNK_SIZE, end)
+    # FIX: if resume_from > 0 or missing_chunks mode but the file doesn't exist yet,
+    # opening in "wb" + seeking to chunk_start silently writes zeros for bytes 0..chunk_start,
+    # corrupting the file; pre-allocate so r+b seeks always land at the right offset
+    if not os.path.exists(output_path) and (resume_from > 0 or missing_chunks is not None):
+        with open(output_path, "wb") as f:
+            f.seek(filesize - 1)
+            f.write(b"\x00")
 
-                # open a fresh connection per chunk since server closes after each request
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(15)
-                sock.connect((peer["ip"], peer["port"]))
+    mode = "r+b" if (missing_chunks is not None or (resume_from > 0 and os.path.exists(output_path))) else "wb"
+    with open(output_path, mode) as f:
+        for chunk_start, chunk_end in chunks:
+            if chunk_start in results:
+                f.seek(chunk_start)
+                f.write(results[chunk_start])
+            elif missing_chunks is None:
+                # normal mode only: zero-fill so the file stays a single
+                # contiguous block on disk — the gap will be retried later
+                f.seek(chunk_start)
+                f.write(b"\x00" * (chunk_end - chunk_start))
+                print(f"  Warning: missing chunk {chunk_start}-{chunk_end}, filled with zeros")
 
-                request = f"GET {filename} {offset} {chunk_end}\n"
-                sock.sendall(request.encode())
+    print(f"  File saved: {output_path}")
 
-                chunk = b""
-                while len(chunk) < chunk_end - offset:
-                    part = sock.recv(chunk_end - offset - len(chunk))
-                    if not part:
-                        break
-                    chunk += part
-
-                sock.close()
-                time.sleep(2)
-                received += chunk
-                offset = chunk_end
-                pct = (len(received)+resume_from) * 100 // filesize if filesize > 0 else 100
-                print(f"\r  Downloading: {pct}% ({len(received)+resume_from}/{filesize} bytes)", end="")
-
-            #Should always start from resume_from but just covering case where it's early
-            overlap = resume_from - download_start
-            if overlap > 0:
-                received = received[overlap:]
-            write_offset = download_start + max(0, overlap)
-            if resume_from > 0 and os.path.exists(output_path):
-                with open(output_path, "r+b") as f:
-                    f.seek(write_offset)
-                    f.write(received)
+    # find the largest contiguous block from byte 0 for updatetracker.
+    if missing_chunks is not None:
+        cont_end = find_contiguous_end(output_path, filesize, CHUNK_SIZE)
+    else:
+        cont_end = resume_from
+        for chunk_start, chunk_end in chunks:
+            if chunk_start == cont_end and chunk_start in results:
+                cont_end = chunk_end
             else:
-                with open(output_path, "wb") as f:
-                    f.write(received)
+                break
 
-            total_bytes = resume_from + len(received)
-            print(f"  File downloaded: {output_path} ({total_bytes} bytes)")
+    if cont_end > 0:
+        print(f"  Sending updatetracker: contiguous range 0-{cont_end}")
+        cmd_updatetracker(client_cfg, server_cfg, filename, 0, cont_end)
 
-            if total_bytes >= filesize:
-                if os.path.exists(cache_path):
-                    os.remove(cache_path)
-                    print(f"  Cache cleaned: {cache_path}")
-                # let the tracker know we have the full file now
-                cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
-            else:
-                cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(total_bytes))
-                print(f"  Warning: only received {total_bytes}/{filesize} bytes.")
-            return
-
-        except Exception as e:
-            print(f"  Failed to download from {peer['ip']}:{peer['port']}: {e}")
-            continue
-        
-    print("  Error: Could not download from any peer.")
+    # FIX: cont_end reaching filesize is necessary but not sufficient — zero-filled failed
+    # chunks could push it there; only declare complete when every expected byte was received
+    if received_bytes == expected_bytes and cont_end >= filesize:
+        print(f"  File download complete: {filename}")
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+            print(f"  Cache cleaned: {cache_path}")
+    else:
+        still_missing = len([c for c in chunks if c[0] not in results])
+        print(f"  Warning: {still_missing} chunk(s) still missing. Will retry on next update cycle.")
 
 
 # --- peer server thread ---
 # this is what other peers connect to when they want chunks from us
 
-def handle_peer_request(conn, addr, shared_folder):
+def handle_peer_request(conn, addr, shared_folder, chunk_delay=0.0):
     print(f"  [SERVER] Connection from peer {addr}")
     try:
         data = conn.recv(4096).decode().strip()
@@ -338,6 +465,8 @@ def handle_peer_request(conn, addr, shared_folder):
             f.seek(start)
             chunk = f.read(end - start)
 
+        if chunk_delay > 0:
+            time.sleep(chunk_delay)  # artificial throttle — must be before sendall so client actually waits
         conn.sendall(chunk)
         print(f"  [SERVER] Sent {len(chunk)} bytes of {filename} to {addr}")
 
@@ -347,17 +476,17 @@ def handle_peer_request(conn, addr, shared_folder):
         conn.close()
 
 
-def start_peer_server(listen_port, shared_folder):
+def start_peer_server(listen_port, shared_folder, chunk_delay=0.0):
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind(("0.0.0.0", listen_port))
-    server_sock.listen(5)
+    server_sock.listen(50)
     print(f"  [SERVER] Peer server listening on port {listen_port}")
 
     while True:
         try:
             conn, addr = server_sock.accept()
-            t = threading.Thread(target=handle_peer_request, args=(conn, addr, shared_folder))
+            t = threading.Thread(target=handle_peer_request, args=(conn, addr, shared_folder, chunk_delay))
             t.daemon = True
             t.start()
         except Exception:
@@ -376,18 +505,21 @@ def periodic_update(client_cfg, server_cfg):
 
     while True:
         time.sleep(interval)
-        if not os.path.exists(shared):
-            continue
-        for fname in os.listdir(shared):
-            fpath = os.path.join(shared, fname)
-            if os.path.isfile(fpath):
-                fsize = os.path.getsize(fpath)
-                msg = f"<updatetracker {fname} 0 {fsize} {ip} {port}>"
-                try:
-                    send_to_tracker(client_cfg["tracker_ip"], client_cfg["tracker_port"], msg)
-                    print(f"  [UPDATE] Sent periodic update for {fname}")
-                except Exception:
-                    pass
+        #Attempt to complete any partial files
+        print(f" [RESUME] Periodic check for partial files to complete")
+        resume_incomplete_downloads(client_cfg, server_cfg)
+        # send updatetracker for every file currently in the shared folder
+        if os.path.exists(shared):
+            for fname in os.listdir(shared):
+                fpath = os.path.join(shared, fname)
+                if os.path.isfile(fpath):
+                    fsize = os.path.getsize(fpath)
+                    msg = f"<updatetracker {fname} 0 {fsize} {ip} {port}>"
+                    try:
+                        send_to_tracker(client_cfg["tracker_ip"], client_cfg["tracker_port"], msg)
+                        print(f"  [UPDATE] Sent periodic update for {fname}")
+                    except Exception:
+                        pass
 
 
 # --- resume incomplete downloads ---
@@ -395,16 +527,16 @@ def periodic_update(client_cfg, server_cfg):
 # continues download from where left off
 
 def resume_incomplete_downloads(client_cfg, server_cfg):
-    shared =server_cfg["shared_folder"]
+    shared = server_cfg["shared_folder"]
     cache_dir = "cache"
 
     if not os.path.exists(cache_dir):
         return
-    
-    track_files = [f for f in os.listdir(cache_dir) if f.endswith("track")]
+
+    track_files = [f for f in os.listdir(cache_dir) if f.endswith(".track")]
     if not track_files:
         return
-    
+
     print(f"\n[RESUME] Found {len(track_files)} cached tracker file(s). Checking for incomplete downloads...")
 
     for trackname in track_files:
@@ -418,33 +550,44 @@ def resume_incomplete_downloads(client_cfg, server_cfg):
         except Exception as e:
             print(f"[RESUME] Could not read {cache_path}: {e}, skipping.")
             continue
+
         filesize = 0
         for line in content.strip().split("\n"):
             if line.startswith("Filesize:"):
                 try:
-                    filesize = int(line.split(':')[1].strip())
+                    filesize = int(line.split(":")[1].strip())
                 except ValueError:
                     pass
                 break
-        
+
         if filesize == 0:
             print(f"[RESUME] Could not determine filesize for {filename}, skipping.")
             continue
 
         if os.path.exists(partial_path):
+            # partial file exists — scan it for null chunks (zero-filled gaps
+            # left by a previous interrupted download) rather than blindly
+            # resuming from the tail, which would miss interior gaps
             partial_size = os.path.getsize(partial_path)
-            #Covering cases: file complete tracker not cleaned up
-            if partial_size >= filesize: 
-                print(f"[RESUME] {filename}: already complete ({partial_size}/{filesize} bytes), cleaning cache.")
-                cmd_updatetracker(client_cfg, server_cfg, filename, "0", str(filesize))
-                os.remove(cache_path)
-            #Partial download to be resumed, fetch fresh tracker and attempt download
-            else:
-                print(f"[RESUME] {filename}: partial file found ({partial_size}/{filesize} bytes), resuming...")
+            print(f"[RESUME] {filename}: potential partial file, scanning for null chunks...")
+            null_chunks = scan_null_chunks(partial_path, filesize)
+
+            if null_chunks:
+                print(f"[RESUME] {filename}: found {len(null_chunks)} null chunk(s), fetching fresh tracker and filling gaps...")
+                cmd_get_tracker(client_cfg, f"{filename}.track")
+                cmd_download(client_cfg, server_cfg, filename, missing_chunks=null_chunks)
+            elif partial_size < filesize:
+                # no interior gaps; file is just truncated — resume from tail
+                print(f"[RESUME] {filename}: no interior gaps, resuming from byte {partial_size}...")
                 cmd_get_tracker(client_cfg, f"{filename}.track")
                 cmd_download(client_cfg, server_cfg, filename, resume_from=partial_size)
-        #Tracker file but no partial, download from beginning
+            else:
+                #No null chunks, file is correct length, file is already downloaded
+                #And just need to clean up cache
+                print(f"[RESUME] {filename}: Already complete, cleaning up leftover cache.")
+                os.remove(cache_path)
         else:
+            # tracker in cache but no partial file; start from scratch
             print(f"[RESUME] {filename}: no partial file found, starting fresh download...")
             cmd_get_tracker(client_cfg, f"{filename}.track")
             cmd_download(client_cfg, server_cfg, filename, resume_from=0)
@@ -534,7 +677,7 @@ def main():
     # server thread - listens for other peers wanting file chunks
     server_thread = threading.Thread(
         target=start_peer_server,
-        args=(server_cfg["listen_port"], server_cfg["shared_folder"])
+        args=(server_cfg["listen_port"], server_cfg["shared_folder"], server_cfg["chunk_delay"])
     )
     server_thread.daemon = True
     server_thread.start()

@@ -39,6 +39,8 @@ BASE_PEER_PORT = 4000              # peer N listens on BASE_PEER_PORT + N (e.g. 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 TORRENTS_DIR   = os.path.join(BASE_DIR, "tracker", "torrents")
 
+CHUNK_DELAY    = 0.5           # wait between sending chunks (to fix port exhaustion and make the download time 1 min 20 s)
+
 SMALL_FILE     = "testfile.txt"     # shared by peer1 (matches Makefile final-setup)
 LARGE_FILE     = "largefile.bin"    # shared by peer2 (matches Makefile final-setup)
 
@@ -159,14 +161,17 @@ signal.signal(signal.SIGINT, cleanup)
 
 
 def drain(proc: subprocess.Popen, label: str) -> None:
-    """Read a subprocess's stdout and echo only high-level peer events.
-    Suppresses internal server thread chatter ([SERVER] connection/request/sent
-    lines) which are too granular for the demo output."""
-    # prefixes that indicate internal server-thread noise — not useful at demo level
     _noise = ("[SERVER]", "[UPDATE] Sent periodic")
+
+    start_time = time.time()
     try:
         for line in proc.stdout:
             line = line.rstrip()
+
+            # suppress startup noise window
+            if time.time() - start_time < 2:
+                continue
+
             if line and not any(n in line for n in _noise):
                 print(f"  [{label}] {line}", flush=True)
     except Exception:
@@ -278,23 +283,24 @@ def download_file_direct(n: int, filename: str, tracker_content: str) -> None:
 
     print(f"  [{label}] Starting download: {filename} ({filesize} bytes, "
           f"{total_chunks} chunks) from [{peer_summary}]", flush=True)
-
+    start = time.time()
+    
     def fetch_chunk(chunk_start: int, chunk_end: int) -> None:
         for peer in peers_sorted:
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(15)
-                sock.connect((peer["ip"], peer["port"]))
-                sock.sendall(f"GET {filename} {chunk_start} {chunk_end}\n".encode())
+                # FIX: Use context manager to ensure socket is always closed
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(15)
+                    sock.connect((peer["ip"], peer["port"]))
+                    sock.sendall(f"GET {filename} {chunk_start} {chunk_end}\n".encode())
 
-                data = b""
-                expected = chunk_end - chunk_start
-                while len(data) < expected:
-                    part = sock.recv(expected - len(data))
-                    if not part:
-                        break
-                    data += part
-                sock.close()
+                    data = b""
+                    expected = chunk_end - chunk_start
+                    while len(data) < expected:
+                        part = sock.recv(expected - len(data))
+                        if not part:
+                            break
+                        data += part
 
                 if data:
                     with results_lock:
@@ -308,6 +314,15 @@ def download_file_direct(n: int, filename: str, tracker_content: str) -> None:
                 )
         print(f"  [{label}] All peers exhausted for chunk {chunk_start}-{chunk_end}", flush=True)
 
+    # FIX: Limit concurrent connections to prevent socket exhaustion (WinError 10055)
+    # Semaphore wraps the function call (matches peer.py pattern)
+    MAX_CONCURRENT = 2
+    semaphore = threading.Semaphore(MAX_CONCURRENT)
+    
+    def throttled_fetch(chunk_start: int, chunk_end: int) -> None:
+        with semaphore:
+            fetch_chunk(chunk_start, chunk_end)
+
     # build chunk list and launch one thread per chunk
     chunks: list[tuple[int, int]] = []
     offset = 0
@@ -316,7 +331,7 @@ def download_file_direct(n: int, filename: str, tracker_content: str) -> None:
         chunks.append((offset, chunk_end))
         offset = chunk_end
 
-    threads = [threading.Thread(target=fetch_chunk, args=(s, e)) for s, e in chunks]
+    threads = [threading.Thread(target=throttled_fetch, args=(s, e)) for s, e in chunks]
     for t in threads:
         t.start()
     for t in threads:
@@ -329,7 +344,7 @@ def download_file_direct(n: int, filename: str, tracker_content: str) -> None:
             f.write(results.get(chunk_start, b"\x00" * (chunk_end - chunk_start)))
 
     received = sum(len(v) for v in results.values())
-    print(f"  [{label}] {filename}: saved {received}/{filesize} bytes -> {out_path}", flush=True)
+    print(f"  [{label}] {filename}: saved {received}/{filesize} bytes -> {out_path}, took {time.time()-start} seconds", flush=True)
 
     if received == filesize:
         print(f"  [{label}] {filename}: download complete", flush=True)
@@ -435,7 +450,7 @@ def runtime_setup() -> None:
         with open(os.path.join(peer_dir, "clientThreadConfig.cfg"), "w") as f:
             f.write(f"{TRACKER_PORT}\n{TRACKER_IP}\n900\n")
         with open(os.path.join(peer_dir, "serverThreadConfig.cfg"), "w") as f:
-            f.write(f"{port}\nshared\n")
+            f.write(f"{port}\nshared\n{CHUNK_DELAY}")
 
     # spec: server must not contain any tracker files prior to start
     os.makedirs(TORRENTS_DIR, exist_ok=True)
@@ -474,16 +489,9 @@ def main() -> None:
     _t0 = time.time()
 
     # ── t=0 : tracker + seed peers ──────────────────────────────
-    log("t=0 : starting tracker + seed peers", "DEMO")
+    log("t=0 : seed peers", "DEMO")
 
-    tracker_proc = start_proc(
-        "TRACKER",
-        os.path.join(BASE_DIR, "tracker", "tracker.py"),
-        cwd=os.path.join(BASE_DIR, "tracker"),
-        use_stdin=False,
-    )
-    time.sleep(1)   # allow socket to bind before peers connect
-    print(f"  [DEMO] Tracker running (pid {tracker_proc.pid})", flush=True)
+    
 
     peer1_proc = start_proc(
         "Peer1",
@@ -549,8 +557,8 @@ def main() -> None:
         time.sleep(0.4)
 
     # ── t=90s : wave 2, peers 9-13 + terminate seeds ────────────
-    _wait_until(90)
-    log("t=90s : starting peers 9-13 (wave 2) + terminating peer1 & peer2", "DEMO")
+    _wait_until(120)
+    log("t=120s : 1 min 30s since last step, starting peers 9-13 (wave 2) + terminating peer1 & peer2", "DEMO")
 
     wave2: list[threading.Thread] = []
     wave2_done: list[threading.Event] = []
@@ -573,6 +581,10 @@ def main() -> None:
     # all downloads done — release every peer so they can quit cleanly
     log("All downloads complete — shutting down peer processes...", "DEMO")
     shutdown_event.set()
+
+    log("ABOUT TO JOIN ALL PEER THREADS", "DEBUG")
+    for i, t in enumerate(wave1 + wave2):
+        print(f"Thread {i} alive={t.is_alive()}", flush=True)
 
     for t in wave1 + wave2:
         t.join()
