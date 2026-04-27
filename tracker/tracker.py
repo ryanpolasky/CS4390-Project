@@ -10,6 +10,7 @@ import hashlib
 
 file_lock = threading.Lock()
 
+
 def read_config():
     with open("sconfig", "r") as f:
         lines = [l.strip() for l in f.readlines() if l.strip()]
@@ -20,50 +21,59 @@ def read_config():
 
 
 def parse_tracker_file(filepath):
+    # raw I/O helper — callers must hold file_lock
     info = {}
     peers = []
-
-    with file_lock:
-        with open(filepath, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("Filename:"):
-                    info["filename"] = line.split(":", 1)[1].strip()
-                elif line.startswith("Filesize:"):
-                    info["filesize"] = line.split(":", 1)[1].strip()
-                elif line.startswith("Description:"):
-                    info["description"] = line.split(":", 1)[1].strip()
-                elif line.startswith("MD5:"):
-                    info["md5"] = line.split(":", 1)[1].strip()
-                elif ":" in line and not line.startswith("<"):
-                    parts = line.split(":")
-                    if len(parts) == 5:
-                        peers.append({
-                            "ip": parts[0],
-                            "port": parts[1],
-                            "start": parts[2],
-                            "end": parts[3],
-                            "timestamp": parts[4]
-                        })
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("Filename:"):
+                info["filename"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Filesize:"):
+                info["filesize"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Description:"):
+                info["description"] = line.split(":", 1)[1].strip()
+            elif line.startswith("MD5:"):
+                info["md5"] = line.split(":", 1)[1].strip()
+            elif ":" in line and not line.startswith("<"):
+                parts = line.split(":")
+                if len(parts) == 5:
+                    peers.append({
+                        "ip": parts[0],
+                        "port": parts[1],
+                        "start": parts[2],
+                        "end": parts[3],
+                        "timestamp": parts[4]
+                    })
     return info, peers
 
 
 def write_tracker_file(filepath, info, peers):
-    with file_lock:
-        with open(filepath, "w") as f:
-            f.write(f"Filename: {info['filename']}\n")
-            f.write(f"Filesize: {info['filesize']}\n")
-            f.write(f"Description: {info.get('description', '')}\n")
-            f.write(f"MD5: {info['md5']}\n")
-            f.write("#list of peers follows next\n")
-            for p in peers:
-                f.write(f"{p['ip']}:{p['port']}:{p['start']}:{p['end']}:{p['timestamp']}\n")
+    # raw I/O helper — callers must hold file_lock
+    with open(filepath, "w") as f:
+        f.write(f"Filename: {info['filename']}\n")
+        f.write(f"Filesize: {info['filesize']}\n")
+        f.write(f"Description: {info.get('description', '')}\n")
+        f.write(f"MD5: {info['md5']}\n")
+        f.write("#list of peers follows next\n")
+        for p in peers:
+            f.write(f"{p['ip']}:{p['port']}:{p['start']}:{p['end']}:{p['timestamp']}\n")
 
 
 def handle_createtracker(parts, torrents_dir):
-    ...
+    # expecting: createtracker filename filesize description md5 ip port
+    if len(parts) < 7:
+        return "<createtracker fail>\n"
+
+    filename = parts[1]
+    filesize = parts[2]
+    description = parts[3]
+    md5 = parts[4]
+    ip = parts[5]
+    port = parts[6]
+
     track_path = os.path.join(torrents_dir, f"{filename}.track")
 
     try:
@@ -72,19 +82,31 @@ def handle_createtracker(parts, torrents_dir):
                 return "<createtracker ferr>\n"
 
             timestamp = str(int(time.time()))
-            info = {...}
-            peers = [...]
-
+            info = {
+                "filename": filename,
+                "filesize": filesize,
+                "description": description,
+                "md5": md5,
+            }
+            peers = [{
+                "ip": ip,
+                "port": port,
+                "start": "0",
+                "end": filesize,
+                "timestamp": timestamp,
+            }]
             write_tracker_file(track_path, info, peers)
 
         print(f"  [TRACKER] Created tracker file: {filename}.track")
         return "<createtracker succ>\n"
 
     except Exception as e:
-        ...
+        print(f"  [TRACKER] Error creating tracker: {e}")
+        return "<createtracker fail>\n"
 
 
 def handle_updatetracker(parts, torrents_dir, update_interval=900):
+    # expecting: updatetracker filename start_bytes end_bytes ip port
     if len(parts) < 6:
         return "<updatetracker fail>\n"
 
@@ -102,7 +124,6 @@ def handle_updatetracker(parts, torrents_dir, update_interval=900):
     try:
         with file_lock:
             info, peers = parse_tracker_file(track_path)
-
             current_time = int(time.time())
 
             found = False
@@ -132,11 +153,8 @@ def handle_updatetracker(parts, torrents_dir, update_interval=900):
         print(f"  [TRACKER] Error updating tracker: {e}")
         return f"<updatetracker {filename} fail>\n"
 
-#Perodic peer pruning, default interval at 900
-#By default called with interval value in sconfig (line 3)
-def periodic_cleanup(torrents_dir, update_interval=900):
-    #Background thread, checks every interval
 
+def periodic_cleanup(torrents_dir, update_interval=900):
     while True:
         # sleep first so we don't run immediately at startup before any peers
         # have had a chance to register
@@ -146,27 +164,21 @@ def periodic_cleanup(torrents_dir, update_interval=900):
         print(f"[CLEANUP] Running periodic dead-peer sweep at {current_time}...")
 
         try:
-            track_files = [
-                f for f in os.listdir(torrents_dir) if f.endswith(".track")
-            ]
+            track_files = [f for f in os.listdir(torrents_dir) if f.endswith(".track")]
         except Exception as e:
             print(f"[CLEANUP] Could not list torrents dir: {e}")
             continue
 
         for tf in track_files:
             track_path = os.path.join(torrents_dir, tf)
-
             try:
                 with file_lock:
                     info, peers = parse_tracker_file(track_path)
-
                     live = [
                         p for p in peers
                         if current_time - int(p["timestamp"]) < update_interval
                     ]
-
                     dead_count = len(peers) - len(live)
-
                     if dead_count > 0:
                         write_tracker_file(track_path, info, live)
                         print(
@@ -179,7 +191,6 @@ def periodic_cleanup(torrents_dir, update_interval=900):
         print("[CLEANUP] Sweep complete.")
 
 
-
 def handle_list(torrents_dir):
     track_files = [f for f in os.listdir(torrents_dir) if f.endswith(".track")]
     count = len(track_files)
@@ -187,7 +198,8 @@ def handle_list(torrents_dir):
     response = f"<REP LIST {count}>\n"
     for i, tf in enumerate(track_files, 1):
         track_path = os.path.join(torrents_dir, tf)
-        info, _ = parse_tracker_file(track_path)
+        with file_lock:
+            info, _ = parse_tracker_file(track_path)
         fname = info.get("filename", tf.replace(".track", ""))
         fsize = info.get("filesize", "0")
         fmd5 = info.get("md5", "")
@@ -206,8 +218,9 @@ def handle_get(parts, torrents_dir):
     if not os.path.exists(track_path):
         return "<GET invalid>\n"
 
-    with open(track_path, "r") as f:
-        content = f.read()
+    with file_lock:
+        with open(track_path, "r") as f:
+            content = f.read()
 
     file_md5 = hashlib.md5(content.encode()).hexdigest()
 
@@ -280,7 +293,6 @@ def main():
     print(f"[TRACKER] Tracker files stored in: {torrents_dir}/")
     print("[TRACKER] Ready to accept connections...")
 
-    #Starting periodic cleanup thread
     cleanup_thread = threading.Thread(target=periodic_cleanup, args=(torrents_dir, update_interval))
     cleanup_thread.daemon = True
     cleanup_thread.start()
@@ -288,7 +300,6 @@ def main():
     try:
         while True:
             conn, addr = server_sock.accept()
-            # spin up a new thread per connection
             t = threading.Thread(target=handle_client, args=(conn, addr, torrents_dir))
             t.daemon = True
             t.start()
