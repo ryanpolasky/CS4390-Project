@@ -480,7 +480,7 @@ def start_peer_server(listen_port, shared_folder, chunk_delay=0.0):
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind(("0.0.0.0", listen_port))
-    server_sock.listen(50)
+    server_sock.listen(200)
     print(f"  [SERVER] Peer server listening on port {listen_port}")
 
     while True:

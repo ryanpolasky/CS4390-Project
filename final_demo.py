@@ -34,12 +34,12 @@ import signal
 # ─────────────────────────────────────────────────────────────────
 
 TRACKER_PORT   = 9090
-TRACKER_IP     = "127.0.0.1"      # change to the tracker machine's IP when running across machines
+TRACKER_IP     = "192.168.1.156"      # change to the tracker machine's IP when running across machines
 BASE_PEER_PORT = 4000              # peer N listens on BASE_PEER_PORT + N (e.g. peer3 -> 4003)
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 TORRENTS_DIR   = os.path.join(BASE_DIR, "tracker", "torrents")
 
-CHUNK_DELAY    = 0.5           # wait between sending chunks (to fix port exhaustion and make the download time 1 min 20 s)
+CHUNK_DELAY    = 1           # wait between sending chunks (to fix port exhaustion and make the download time 1 min 20 s)
 
 SMALL_FILE     = "testfile.txt"     # shared by peer1 (matches Makefile final-setup)
 LARGE_FILE     = "largefile.bin"    # shared by peer2 (matches Makefile final-setup)
@@ -91,7 +91,7 @@ def send_to_tracker(message: str, label: str = "DEMO") -> str:
     """Send one protocol message to the tracker and return the full reply."""
     print(f"  {label}: >> {message}", flush=True)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10)
+    sock.settimeout(15)
     sock.connect((TRACKER_IP, TRACKER_PORT))
     sock.sendall((message + "\n").encode())
     response = b""
@@ -307,11 +307,12 @@ def download_file_direct(n: int, filename: str, tracker_content: str) -> None:
                         results[chunk_start] = data
                     return
             except Exception as e:
-                print(
+                #Uncomment to add chunk-level failure logs
+                '''print(
                     f"  [{label}] chunk {chunk_start}-{chunk_end} failed "
                     f"({peer['ip']}:{peer['port']}): {e}, trying next...",
                     flush=True
-                )
+                )'''
         print(f"  [{label}] All peers exhausted for chunk {chunk_start}-{chunk_end}", flush=True)
 
     # FIX: Limit concurrent connections to prevent socket exhaustion (WinError 10055)
