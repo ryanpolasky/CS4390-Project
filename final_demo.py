@@ -5,10 +5,10 @@
 # t=90s: peers 9-13 join, peer1 + peer2 are terminated
 # peers 9-13 must complete download from peers 3-8's partial files only
 
-import hashlib, os, shutil, signal, socket, subprocess, sys, time
+import hashlib, os, shutil, signal, socket, subprocess, sys, threading, time
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-TRACKER_IP  = "127.0.0.1"
+TRACKER_IP  = "10.255.203.4"
 TRACKER_PORT = 9090
 WAVE1       = list(range(3, 9))    # peers 3-8,  join at t=30s
 WAVE2       = list(range(9, 14))   # peers 9-13, join at t=90s
@@ -76,16 +76,27 @@ def create_peer_dir(n):
         temp_dirs.append(d)
 
 
+def peer_log_reader(n, stream):
+    for raw in stream:
+        line = raw.decode(errors="replace").rstrip()
+        if not line:
+            continue
+        elapsed = time.time() - START_TIME
+        print(f"[peer{n:>2} t={elapsed:6.1f}s] {line}", flush=True)
+
+
 def start_peer(n):
     d = peer_dir(n)
     proc = subprocess.Popen(
         [sys.executable, "peer.py"],
         cwd=d,
         stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
     )
     processes[n] = proc
+    t = threading.Thread(target=peer_log_reader, args=(n, proc.stdout), daemon=True)
+    t.start()
     return proc
 
 
@@ -188,7 +199,7 @@ def main():
     # ── t=30s ─────────────────────────────────────────────────────
     banner("Waiting 30s for wave 1...")
     time.sleep(30)
-    banner("t=30s  Starting peers 3-8 — downloading largefile.bin")
+    banner("t=30s  Starting peers 3-8 — downloading testfile.txt + largefile.bin")
 
     for n in WAVE1:
         create_peer_dir(n)
@@ -197,8 +208,9 @@ def main():
     time.sleep(1.5)
 
     for n in WAVE1:
+        send_cmd(n, "download testfile.txt")
         send_cmd(n, "download largefile.bin")
-        print(f"  peer{n}: issued download largefile.bin")
+        print(f"  peer{n}: issued download testfile.txt + largefile.bin")
 
     # ── t=90s ─────────────────────────────────────────────────────
     banner("Waiting 60s for wave 2...")
@@ -216,10 +228,12 @@ def main():
     time.sleep(1.5)
 
     for n in WAVE2:
+        send_cmd(n, "download testfile.txt")
         send_cmd(n, "download largefile.bin")
-        print(f"  peer{n}: issued download largefile.bin")
+        print(f"  peer{n}: issued download testfile.txt + largefile.bin")
 
     print("\n  Seed peers are gone — peers 9-13 rely on peers 3-8 partial files only")
+    print("  testfile.txt must come from wave-1 peers (peer1 is terminated)")
 
     # ── monitor ───────────────────────────────────────────────────
     banner("Monitoring downloads — Ctrl+C to stop")
@@ -228,12 +242,15 @@ def main():
             time.sleep(15)
             elapsed = time.time() - START_TIME
             alive = [n for n in WAVE1 + WAVE2 if processes[n].poll() is None]
-            completed = []
+            lf_done, tf_done = [], []
             for n in WAVE1 + WAVE2:
-                p = os.path.join(peer_dir(n), "shared", "largefile.bin")
-                if os.path.exists(p) and os.path.getsize(p) == lf_size:
-                    completed.append(n)
-            print(f"[t={elapsed:.0f}s]  alive: {len(alive)} peers  |  completed: {len(completed)} peers {completed}")
+                lp = os.path.join(peer_dir(n), "shared", "largefile.bin")
+                tp = os.path.join(peer_dir(n), "shared", "testfile.txt")
+                if os.path.exists(lp) and os.path.getsize(lp) == lf_size:
+                    lf_done.append(n)
+                if os.path.exists(tp) and os.path.getsize(tp) == tf_size:
+                    tf_done.append(n)
+            print(f"[t={elapsed:.0f}s]  alive: {len(alive)} peers  |  largefile done: {lf_done}  |  testfile done: {tf_done}")
     except KeyboardInterrupt:
         pass
 
