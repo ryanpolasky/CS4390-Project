@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-# Test that the configurable chunk_delay in serverThreadConfig.cfg
-# is actually throttling chunk transfers.
-#
-# Spins up peer2's server (delay=0.005), requests N chunks,
-# and verifies elapsed time >= N * chunk_delay.
+# test that chunk_delay config actually throttles chunk transfers
 
 import subprocess, socket, time, os, sys, signal
 

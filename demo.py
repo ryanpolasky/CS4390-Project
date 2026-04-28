@@ -198,7 +198,7 @@ def main():
 
     step("peer3 downloads first 10 chunks of largefile.bin from peer2 (port {})".format(PEER2_PORT))
     CHUNK_SIZE = 1024
-    DEMO_CHUNKS = 10  # download first 10 chunks to demonstrate the protocol without waiting for full 10MB
+    DEMO_CHUNKS = 10  # just first 10 to keep demo quick
     data2 = b""
     for i in range(DEMO_CHUNKS):
         chunk_start = i * CHUNK_SIZE

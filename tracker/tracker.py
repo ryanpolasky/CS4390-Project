@@ -144,6 +144,12 @@ def handle_updatetracker(parts, torrents_dir, update_interval=900):
                     "timestamp": str(current_time),
                 })
 
+            # prune dead peers while we have the lock
+            peers = [
+                p for p in peers
+                if current_time - int(p["timestamp"]) < update_interval
+            ]
+
             write_tracker_file(track_path, info, peers)
 
         print(f"  [TRACKER] Updated tracker: {filename}.track for peer {ip}:{port}")
@@ -156,8 +162,7 @@ def handle_updatetracker(parts, torrents_dir, update_interval=900):
 
 def periodic_cleanup(torrents_dir, update_interval=900):
     while True:
-        # sleep first so we don't run immediately at startup before any peers
-        # have had a chance to register
+        # sleep first so peers can register before we start cleaning
         time.sleep(update_interval)
 
         current_time = int(time.time())
@@ -232,7 +237,7 @@ def handle_get(parts, torrents_dir):
     return response
 
 
-def handle_client(conn, addr, torrents_dir):
+def handle_client(conn, addr, torrents_dir, update_interval=900):
     # each connection gets its own thread, handles one request then closes
     print(f"[TRACKER] Connection from {addr}")
     try:
@@ -262,7 +267,7 @@ def handle_client(conn, addr, torrents_dir):
         if command == "createtracker":
             response = handle_createtracker(parts, torrents_dir)
         elif command == "updatetracker":
-            response = handle_updatetracker(parts, torrents_dir)
+            response = handle_updatetracker(parts, torrents_dir, update_interval)
         elif command == "req" and len(parts) > 1 and parts[1].upper() == "LIST":
             response = handle_list(torrents_dir)
         elif command == "get":
@@ -300,7 +305,7 @@ def main():
     try:
         while True:
             conn, addr = server_sock.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr, torrents_dir))
+            t = threading.Thread(target=handle_client, args=(conn, addr, torrents_dir, update_interval))
             t.daemon = True
             t.start()
     except KeyboardInterrupt:

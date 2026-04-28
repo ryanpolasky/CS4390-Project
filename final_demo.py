@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# Final demo script
-# t=0:   tracker + peer1 (testfile seed) + peer2 (largefile seed)
-# t=30s: peers 3-8 join and download largefile.bin
-# t=90s: peers 9-13 join, peer1 + peer2 are terminated
-# peers 9-13 must complete download from peers 3-8's partial files only
+# final demo script
+# t=0: tracker + peer1 (testfile) + peer2 (largefile)
+# t=30s: peers 3-8 join and download both files
+# t=90s: seeds die, peers 9-13 join and finish from partial peers
 
 import hashlib, os, shutil, signal, socket, subprocess, sys, threading, time
 

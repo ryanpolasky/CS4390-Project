@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# Tests for parallel chunk download and resume.
-# Spins up the real tracker + peer1 + peer2, then exercises cmd_download
-# with resume_from=0 (full parallel) and resume_from>0 (resume path).
+# tests parallel chunk download and resume with real tracker + peers
 
 import subprocess, time, os, sys, hashlib, socket, shutil, signal
 
