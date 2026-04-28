@@ -6,7 +6,6 @@
 import socket
 import threading
 import os
-import sys
 import hashlib
 import time
 
@@ -66,8 +65,7 @@ def send_to_tracker(tracker_ip, tracker_port, message):
             response += chunk
             # check if we got a full response yet
             decoded = response.decode()
-            if (decoded.strip().endswith(">\n") or
-                decoded.strip().endswith(">") or
+            if (decoded.strip().endswith(">") or
                 "REP LIST END" in decoded or
                 "REP GET END" in decoded):
                 break
@@ -326,8 +324,7 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks
 
     CHUNK_SIZE = 1024
 
-    # build chunk list — if the caller passed in specific null chunks from a
-    # scan, use those directly; otherwise build sequentially from resume_from
+    # use caller's null chunks if given, otherwise build sequentially from resume_from
     if missing_chunks is not None:
         chunks = missing_chunks
         print(f"  Filling {len(chunks)} null chunk(s) identified by scan")
@@ -699,7 +696,7 @@ def main():
     server_thread.start()
 
     resume_incomplete_downloads(client_cfg, server_cfg)
-    
+
     # background thread for periodic tracker updates
     update_thread = threading.Thread(
         target=periodic_update,
