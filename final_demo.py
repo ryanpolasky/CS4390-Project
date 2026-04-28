@@ -206,10 +206,12 @@ def main():
         print(f"  peer{n} started on port {4000+n}")
     time.sleep(1.5)
 
+    # spec wants list before get/download for each joining peer -ryan
     for n in WAVE1:
+        send_cmd(n, "list")
         send_cmd(n, "download testfile.txt")
         send_cmd(n, "download largefile.bin")
-        print(f"  peer{n}: issued download testfile.txt + largefile.bin")
+        print(f"  peer{n}: issued list + download testfile.txt + largefile.bin")
 
     # ── t=90s ─────────────────────────────────────────────────────
     banner("Waiting 60s for wave 2...")
@@ -227,9 +229,10 @@ def main():
     time.sleep(1.5)
 
     for n in WAVE2:
+        send_cmd(n, "list")
         send_cmd(n, "download testfile.txt")
         send_cmd(n, "download largefile.bin")
-        print(f"  peer{n}: issued download testfile.txt + largefile.bin")
+        print(f"  peer{n}: issued list + download testfile.txt + largefile.bin")
 
     print("\n  Seed peers are gone — peers 9-13 rely on peers 3-8 partial files only")
     print("  testfile.txt must come from wave-1 peers (peer1 is terminated)")

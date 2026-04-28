@@ -152,7 +152,10 @@ def cmd_get_tracker(client_cfg, trackname):
         if file_md5_val and content_md5 == file_md5_val:
             print("  MD5 verification: PASSED")
         else:
+            # mismatch — bail without caching, dont trust it -ryan
             print(f"  MD5 verification: FAILED (got {content_md5}, expected {file_md5_val})")
+            print("  Discarding tracker data — not saving to cache.")
+            return None
 
         # save to local cache so we dont have to re-fetch
         os.makedirs("cache", exist_ok=True)
@@ -358,9 +361,42 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks
     t0 = time.time()
     last_print_time = [t0]
 
+    # fire updatetracker every ~10% of progress so partial state propagates
+    # to other peers mid-download. matches spec's "after a complete segment"
+    update_milestone = max(1, total_chunks // 10)
+    last_update_completed = [0]
+
+    def compute_contiguous_end():
+        # walk results from resume_from to find first gap
+        with results_lock:
+            ends = {cs: cs + len(v) for cs, v in results.items()}
+        expected = resume_from
+        for cs in sorted(ends.keys()):
+            if cs == expected:
+                expected = ends[cs]
+            elif cs < expected:
+                continue
+            else:
+                break
+        return expected
+
+    def fire_progress_update():
+        # fire-and-forget so we dont block the next chunk on tracker latency
+        cont_end = compute_contiguous_end()
+        if cont_end <= resume_from:
+            return
+        ip_self = get_my_ip()
+        port_self = server_cfg["listen_port"]
+        msg = f"<updatetracker {filename} 0 {cont_end} {ip_self} {port_self}>"
+        try:
+            send_to_tracker(client_cfg["tracker_ip"], client_cfg["tracker_port"], msg)
+        except Exception:
+            pass
+
     def throttled_download(eligible_sorted, chunk_start, chunk_end):
         with semaphore:
             download_chunk(eligible_sorted, filename, chunk_start, chunk_end, results, results_lock, dead_peers, dead_peers_lock)
+        send_update = False
         with completed_lock:
             completed[0] += 1
             c = completed[0]
@@ -372,6 +408,12 @@ def cmd_download(client_cfg, server_cfg, filename, resume_from=0, missing_chunks
                 pct = 100 * c // total_chunks if total_chunks else 0
                 print(f"  [PROGRESS] {filename}: {c}/{total_chunks} chunks ({pct}%) — {rate:.1f} KB/s", flush=True)
                 last_print_time[0] = now
+            # milestone gate so we dont spam the tracker
+            if c - last_update_completed[0] >= update_milestone and c < total_chunks:
+                last_update_completed[0] = c
+                send_update = True
+        if send_update:
+            threading.Thread(target=fire_progress_update, daemon=True).start()
 
     threads = []
     for chunk_start, chunk_end, eligible in chunk_peer_map:
